@@ -1,0 +1,123 @@
+syntax = "proto3";
+
+package api.v1;
+
+option go_package = "github.com/elee1766/btrfsguid/gen/api/v1;apiv1";
+
+service ScrubService {
+  rpc StartScrub(StartScrubRequest) returns (StartScrubResponse) {}
+  rpc CancelScrub(CancelScrubRequest) returns (CancelScrubResponse) {}
+  rpc GetScrubStatus(GetScrubStatusRequest) returns (GetScrubStatusResponse) {}
+  rpc GetAllScrubStatus(GetAllScrubStatusRequest) returns (GetAllScrubStatusResponse) {}
+  rpc StreamScrubProgress(StreamScrubProgressRequest) returns (stream ScrubProgress) {}
+  rpc ListScrubHistory(ListScrubHistoryRequest) returns (ListScrubHistoryResponse) {}
+}
+
+message StartScrubRequest {
+  string device_path = 1;
+  bool readonly = 2;
+  // Throughput limit per device (bytes/sec), 0 = unlimited
+  int64 limit_bytes_per_sec = 3;
+  // Force start even if scrub status file indicates one is running
+  bool force = 4;
+}
+
+// Flags used when starting a scrub, stored in history
+message ScrubFlags {
+  bool readonly = 1;
+  int64 limit_bytes_per_sec = 2;
+  bool force = 3;
+}
+
+message StartScrubResponse {
+  string scrub_id = 1;
+  bool started = 2;
+}
+
+message CancelScrubRequest {
+  string device_path = 1;
+}
+
+message CancelScrubResponse {
+  bool success = 1;
+}
+
+message GetScrubStatusRequest {
+  string device_path = 1;
+}
+
+message ScrubProgress {
+  int64 bytes_scrubbed = 1;
+  int64 total_bytes = 2;
+  int32 data_errors = 3;
+  int32 tree_errors = 4;
+  int32 corrected_errors = 5;
+  int32 uncorrectable_errors = 6;
+  string status = 7;
+  int64 started_at = 8;
+  int64 finished_at = 9;
+  double progress_percent = 10;
+  // Extended scrub statistics
+  int64 data_bytes_scrubbed = 11;
+  int64 tree_bytes_scrubbed = 12;
+  int64 data_extents_scrubbed = 13;
+  int64 tree_extents_scrubbed = 14;
+  int32 read_errors = 15;
+  int32 csum_errors = 16;
+  int32 verify_errors = 17;
+  int64 no_csum = 18;
+  int64 csum_discards = 19;
+  int32 super_errors = 20;
+  int32 malloc_errors = 21;
+  int32 unverified_errors = 22;
+  int64 last_physical = 23;
+  string duration = 24;
+  int64 duration_seconds = 25;
+  // Rate and ETA (only available when scrub is running)
+  int64 rate_bytes_per_sec = 26;
+  int64 eta_seconds = 27;
+}
+
+message GetScrubStatusResponse {
+  ScrubProgress progress = 1;
+  bool is_running = 2;
+}
+
+message StreamScrubProgressRequest {
+  string device_path = 1;
+}
+
+message ScrubHistoryEntry {
+  string scrub_id = 1;
+  string device_path = 2;
+  int64 started_at = 3;
+  int64 finished_at = 4;
+  int32 total_errors = 5;
+  int32 corrected_errors = 6;
+  string status = 7;
+  // Flags used when starting this scrub
+  ScrubFlags flags = 8;
+}
+
+message ListScrubHistoryRequest {
+  string device_path = 1;
+  int32 limit = 2;
+}
+
+message ListScrubHistoryResponse {
+  repeated ScrubHistoryEntry entries = 1;
+}
+
+// Get scrub status for all tracked filesystems
+message GetAllScrubStatusRequest {}
+
+message FilesystemScrubStatus {
+  string path = 1;
+  ScrubProgress progress = 2;
+  bool is_running = 3;
+  string error_message = 4;  // If there was an error fetching
+}
+
+message GetAllScrubStatusResponse {
+  repeated FilesystemScrubStatus filesystems = 1;
+}

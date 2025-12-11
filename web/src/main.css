@@ -1,0 +1,123 @@
+@import "tailwindcss";
+
+/* Prevent dragging on interactive elements */
+a,
+button {
+  -webkit-user-drag: none;
+  user-drag: none;
+}
+
+/* Prevent all dragging in header and nav areas */
+header,
+header *,
+nav,
+nav * {
+  -webkit-user-drag: none;
+  user-drag: none;
+}
+
+/* Fonts */
+@font-face {
+  font-family: 'Cousine';
+  src: url('./fonts/Cousine-Regular.ttf') format('truetype');
+  font-weight: 400;
+  font-style: normal;
+  font-display: swap;
+}
+
+@font-face {
+  font-family: 'Cousine';
+  src: url('./fonts/Cousine-Bold.ttf') format('truetype');
+  font-weight: 700;
+  font-style: normal;
+  font-display: swap;
+}
+
+@font-face {
+  font-family: 'Cousine';
+  src: url('./fonts/Cousine-Italic.ttf') format('truetype');
+  font-weight: 400;
+  font-style: italic;
+  font-display: swap;
+}
+
+@font-face {
+  font-family: 'Cousine';
+  src: url('./fonts/Cousine-BoldItalic.ttf') format('truetype');
+  font-weight: 700;
+  font-style: italic;
+  font-display: swap;
+}
+
+/* Semantic color tokens using CSS custom properties */
+/* These can be overridden for dark mode with media queries or class-based switching */
+
+@theme {
+  /* Font family */
+  --font-sans: 'Cousine', monospace;
+  --font-mono: 'Cousine', monospace;
+
+  /*
+   * Semantic color tokens
+   * Named by purpose, not by color value
+   */
+
+  /* Background colors */
+  --color-bg-base: #f3f4f6;        /* Page background - gray-100 */
+  --color-bg-surface: #ffffff;     /* Card/section background - white */
+  --color-bg-surface-raised: #f9fafb; /* Subtle elevated bg - gray-50 */
+  --color-bg-muted: #e5e7eb;       /* Progress bar bg, etc - gray-200 */
+  --color-bg-overlay: #111827;     /* Tooltips, overlays - gray-900 */
+
+  /* Text colors */
+  --color-text-default: #374151;   /* Primary text - gray-700 */
+  --color-text-secondary: #4b5563; /* Secondary text - gray-600 */
+  --color-text-tertiary: #6b7280;  /* Labels - gray-500 */
+  --color-text-muted: #9ca3af;     /* Muted text - gray-400 */
+  --color-text-faint: #d1d5db;     /* Very muted/dividers - gray-300 */
+  --color-text-inverse: #ffffff;   /* Text on dark bg - white */
+
+  /* Border colors */
+  --color-border-default: #e5e7eb; /* Standard border - gray-200 */
+  --color-border-subtle: #f3f4f6;  /* Subtle border - gray-100 */
+  --color-border-strong: #d1d5db;  /* Emphasized border - gray-300 */
+
+  /* Primary (blue) */
+  --color-primary: #2563eb;        /* Primary action - blue-600 */
+  --color-primary-hover: #1d4ed8;  /* Primary hover - blue-700 */
+  --color-primary-strong: #1e40af; /* Primary emphasis - blue-800 */
+  --color-primary-soft: #3b82f6;   /* Primary soft - blue-500 */
+  --color-primary-softer: #60a5fa; /* Primary softer - blue-400 */
+  --color-primary-subtle: #dbeafe; /* Primary bg tint - blue-50 */
+  --color-primary-muted: #bfdbfe;  /* Primary muted - blue-100 */
+
+  /* Success (green) */
+  --color-success: #16a34a;        /* Success - green-600 */
+  --color-success-soft: #22c55e;   /* Success soft - green-500 */
+  --color-success-subtle: #f0fdf4; /* Success bg tint - green-50 */
+  --color-success-muted: #bbf7d0;  /* Success muted - green-200 */
+
+  /* Warning (yellow) */
+  --color-warning: #ca8a04;        /* Warning - yellow-600 */
+  --color-warning-soft: #eab308;   /* Warning soft - yellow-500 */
+  --color-warning-subtle: #fef9c3; /* Warning bg tint - yellow-100 */
+  --color-warning-muted: #854d0e;  /* Warning dark - yellow-700 */
+
+  /* Error (red) */
+  --color-error: #dc2626;          /* Error - red-600 */
+  --color-error-soft: #ef4444;     /* Error soft - red-500 */
+  --color-error-hover: #b91c1c;    /* Error hover - red-700 */
+  --color-error-subtle: #fef2f2;   /* Error bg tint - red-50 */
+
+  /* Interactive (gray buttons, toggles) */
+  --color-interactive: #4b5563;    /* Interactive bg - gray-600 */
+  --color-interactive-hover: #374151; /* Interactive hover - gray-700 */
+  --color-interactive-strong: #1f2937; /* Interactive emphasis - gray-800 */
+  --color-interactive-soft: #6b7280; /* Interactive soft - gray-500 */
+
+  /* Visualization colors */
+  --color-viz-data: #3b82f6;       /* Data chunks - blue-500 */
+  --color-viz-metadata: #a855f7;   /* Metadata - purple-500 */
+  --color-viz-system: #f97316;     /* System - orange-500 */
+  --color-viz-free: #e5e7eb;       /* Free space - gray-200 */
+}

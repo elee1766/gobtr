@@ -1,0 +1,44 @@
+syntax = "proto3";
+
+package api.v1;
+
+option go_package = "github.com/elee1766/btrfsguid/gen/api/v1;apiv1";
+
+service SubvolumeService {
+  rpc ListSubvolumes(ListSubvolumesRequest) returns (ListSubvolumesResponse) {}
+  rpc ListAllSubvolumes(ListAllSubvolumesRequest) returns (ListAllSubvolumesResponse) {}
+}
+
+message Subvolume {
+  int64 id = 1;
+  int64 gen = 2;
+  int64 top_level = 3;
+  string path = 4;
+  string uuid = 5;
+  string parent_uuid = 6;
+  bool is_readonly = 7;
+  int64 created_at = 8;
+  uint64 flags = 9;  // Raw btrfs root flags
+}
+
+message ListSubvolumesRequest {
+  string mount_path = 1;
+}
+
+message ListSubvolumesResponse {
+  repeated Subvolume subvolumes = 1;
+}
+
+// List subvolumes from all tracked filesystems
+message ListAllSubvolumesRequest {}
+
+message FilesystemSubvolumes {
+  string path = 1;
+  repeated Subvolume subvolumes = 2;
+  string error_message = 3;  // If there was an error fetching
+  string btrbk_snapshot_dir = 4;  // Configured btrbk snapshot directory for this filesystem
+}
+
+message ListAllSubvolumesResponse {
+  repeated FilesystemSubvolumes filesystems = 1;
+}

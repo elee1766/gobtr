@@ -1,0 +1,131 @@
+syntax = "proto3";
+
+package api.v1;
+
+option go_package = "github.com/elee1766/btrfsguid/gen/api/v1;apiv1";
+
+service BalanceService {
+  rpc StartBalance(StartBalanceRequest) returns (StartBalanceResponse) {}
+  rpc CancelBalance(CancelBalanceRequest) returns (CancelBalanceResponse) {}
+  rpc GetBalanceStatus(GetBalanceStatusRequest) returns (GetBalanceStatusResponse) {}
+  rpc GetAllBalanceStatus(GetAllBalanceStatusRequest) returns (GetAllBalanceStatusResponse) {}
+  rpc ListBalanceHistory(ListBalanceHistoryRequest) returns (ListBalanceHistoryResponse) {}
+}
+
+message StartBalanceRequest {
+  string device_path = 1;
+  // Filter options for balance (e.g., data, metadata, system)
+  BalanceFilters filters = 2;
+  // Throughput limit (percentage 1-100 or 0 for unlimited)
+  int32 limit_percent = 3;
+  // Background mode (run with lower priority)
+  bool background = 4;
+  // Dry run (estimate without actually moving data)
+  bool dry_run = 5;
+  // Force start even if balance is already running
+  bool force = 6;
+}
+
+// Filters for what to balance
+message BalanceFilters {
+  bool data = 1;      // Balance data chunks
+  bool metadata = 2;  // Balance metadata chunks
+  bool system = 3;    // Balance system chunks
+  // Usage-based filtering (balance chunks with usage <= this percent)
+  int32 usage_percent = 4;
+  // Limit number of chunks to process (0 = no limit)
+  int64 limit_chunks = 5;
+}
+
+// Flags used when starting a balance, stored in history
+message BalanceFlags {
+  BalanceFilters filters = 1;
+  int32 limit_percent = 2;
+  bool background = 3;
+  bool dry_run = 4;
+  bool force = 5;
+}
+
+message StartBalanceResponse {
+  string balance_id = 1;
+  bool started = 2;
+}
+
+message CancelBalanceRequest {
+  string device_path = 1;
+}
+
+message CancelBalanceResponse {
+  bool success = 1;
+}
+
+message GetBalanceStatusRequest {
+  string device_path = 1;
+}
+
+message BalanceProgress {
+  // Current state
+  string status = 1;  // running, finished, cancelled, paused, never_run
+  bool is_running = 2;
+
+  // Progress info
+  int64 total_chunks = 3;
+  int64 considered = 4;     // Chunks considered for relocation
+  int64 relocated = 5;      // Chunks actually relocated
+  int64 left = 6;           // Chunks left to process
+
+  // Size info
+  int64 size_total = 7;     // Total size of all chunks
+  int64 size_relocated = 8; // Size of relocated chunks
+
+  // Timing
+  int64 started_at = 9;
+  int64 finished_at = 10;
+  string duration = 11;
+  int64 duration_seconds = 12;
+
+  // Error info
+  int32 soft_errors = 13;   // Errors that allowed balance to continue
+
+  // Progress percentage (calculated)
+  double progress_percent = 14;
+}
+
+message GetBalanceStatusResponse {
+  BalanceProgress progress = 1;
+  bool is_running = 2;
+}
+
+message GetAllBalanceStatusRequest {}
+
+message FilesystemBalanceStatus {
+  string path = 1;
+  BalanceProgress progress = 2;
+  bool is_running = 3;
+  string error_message = 4;
+}
+
+message GetAllBalanceStatusResponse {
+  repeated FilesystemBalanceStatus filesystems = 1;
+}
+
+message BalanceHistoryEntry {
+  string balance_id = 1;
+  string device_path = 2;
+  int64 started_at = 3;
+  int64 finished_at = 4;
+  string status = 5;
+  int64 chunks_relocated = 6;
+  int64 size_relocated = 7;
+  int32 soft_errors = 8;
+  BalanceFlags flags = 9;
+}
+
+message ListBalanceHistoryRequest {
+  string device_path = 1;
+  int32 limit = 2;
+}
+
+message ListBalanceHistoryResponse {
+  repeated BalanceHistoryEntry entries = 1;
+}

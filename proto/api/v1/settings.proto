@@ -1,0 +1,32 @@
+syntax = "proto3";
+
+package api.v1;
+
+option go_package = "github.com/elee1766/btrfsguid/gen/api/v1;apiv1";
+
+service SettingsService {
+  // GetSettings returns the current server settings
+  rpc GetSettings(GetSettingsRequest) returns (GetSettingsResponse) {}
+
+  // UpdateSettings updates server settings
+  rpc UpdateSettings(UpdateSettingsRequest) returns (UpdateSettingsResponse) {}
+}
+
+message ServerSettings {
+  // Default target number of samples for usage sampling (default: 500000)
+  uint64 default_sample_target = 1;
+}
+
+message GetSettingsRequest {}
+
+message GetSettingsResponse {
+  ServerSettings settings = 1;
+}
+
+message UpdateSettingsRequest {
+  ServerSettings settings = 1;
+}
+
+message UpdateSettingsResponse {
+  ServerSettings settings = 1;
+}

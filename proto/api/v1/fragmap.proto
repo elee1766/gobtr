@@ -1,0 +1,148 @@
+syntax = "proto3";
+
+package api.v1;
+
+option go_package = "github.com/elee1766/btrfsguid/gen/api/v1;apiv1";
+
+service FragMapService {
+  // Get the complete fragmentation map for a filesystem
+  rpc GetFragMap(GetFragMapRequest) returns (GetFragMapResponse) {}
+  // Get block map data for a specific device
+  rpc GetDeviceBlockMap(GetDeviceBlockMapRequest) returns (GetDeviceBlockMapResponse) {}
+  // Get block maps for multiple devices in parallel
+  rpc GetDeviceBlockMaps(GetDeviceBlockMapsRequest) returns (GetDeviceBlockMapsResponse) {}
+  // Get heat map data for visualization
+  rpc GetHeatMap(GetHeatMapRequest) returns (GetHeatMapResponse) {}
+  // Get fragmentation statistics
+  rpc GetFragStats(GetFragStatsRequest) returns (GetFragStatsResponse) {}
+}
+
+message GetFragMapRequest {
+  string fs_path = 1;
+}
+
+message Device {
+  uint64 id = 1;
+  bytes uuid = 2;
+  uint64 total_size = 3;
+  string path = 4;
+}
+
+message Stripe {
+  uint64 device_id = 1;
+  uint64 offset = 2;
+}
+
+message Chunk {
+  uint64 logical_offset = 1;
+  uint64 length = 2;
+  uint64 type = 3;  // data=1, system=2, metadata=4
+  uint64 profile = 4;  // RAID profile flags
+  repeated Stripe stripes = 5;
+  uint64 used = 6;  // Bytes used within this chunk
+}
+
+message DeviceExtent {
+  uint64 device_id = 1;
+  uint64 physical_offset = 2;
+  uint64 length = 3;
+  uint64 chunk_offset = 4;
+}
+
+message GetFragMapResponse {
+  uint64 total_size = 1;
+  repeated Device devices = 2;
+  repeated Chunk chunks = 3;
+  // Device extents keyed by device ID would need a map, but proto3 maps can't have uint64 keys
+  // So we include device_id in each extent
+  repeated DeviceExtent device_extents = 4;
+}
+
+message GetDeviceBlockMapRequest {
+  string fs_path = 1;
+  uint64 device_id = 2;
+}
+
+message BlockMapEntry {
+  uint64 offset = 1;
+  uint64 length = 2;
+  uint64 type = 3;
+  uint64 profile = 4;
+  bool allocated = 5;
+  uint64 chunk_offset = 6;
+  uint64 chunk_used = 7;      // Bytes used within the chunk
+  uint64 chunk_length = 8;    // Total chunk size (for utilization calculation)
+}
+
+message GetDeviceBlockMapResponse {
+  uint64 device_id = 1;
+  uint64 total_size = 2;
+  repeated BlockMapEntry entries = 3;
+}
+
+message GetHeatMapRequest {
+  string fs_path = 1;
+  uint64 device_id = 2;
+  int32 resolution = 3;  // Number of cells (default 256)
+}
+
+message HeatMapCell {
+  int32 index = 1;
+  uint64 start_offset = 2;
+  uint64 end_offset = 3;
+  uint64 allocated_bytes = 4;
+  uint64 free_bytes = 5;
+  uint64 data_bytes = 6;
+  uint64 metadata_bytes = 7;
+  uint64 system_bytes = 8;
+  int32 extent_count = 9;
+  double utilization = 10;  // 0.0 to 1.0
+}
+
+message GetHeatMapResponse {
+  uint64 device_id = 1;
+  uint64 total_size = 2;
+  int32 resolution = 3;
+  repeated HeatMapCell cells = 4;
+}
+
+message GetFragStatsRequest {
+  string fs_path = 1;
+  uint64 device_id = 2;  // 0 for all devices
+}
+
+message FragStats {
+  uint64 device_id = 1;
+  uint64 total_size = 2;
+  uint64 allocated_size = 3;
+  uint64 free_size = 4;
+  uint64 data_size = 5;
+  uint64 metadata_size = 6;
+  uint64 system_size = 7;
+  int32 num_extents = 8;
+  int32 num_free_regions = 9;
+  uint64 largest_free = 10;
+  uint64 smallest_free = 11;
+  uint64 avg_extent_size = 12;
+  uint64 avg_free_size = 13;
+}
+
+message GetFragStatsResponse {
+  repeated FragStats stats = 1;
+}
+
+message GetDeviceBlockMapsRequest {
+  string fs_path = 1;
+  repeated uint64 device_ids = 2;  // List of device IDs to fetch
+}
+
+message DeviceBlockMap {
+  Device device = 1;
+  uint64 total_size = 2;
+  repeated BlockMapEntry entries = 3;
+  FragStats stats = 4;
+}
+
+message GetDeviceBlockMapsResponse {
+  repeated DeviceBlockMap maps = 1;
+}

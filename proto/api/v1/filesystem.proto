@@ -1,0 +1,193 @@
+syntax = "proto3";
+
+package api.v1;
+
+option go_package = "github.com/elee1766/btrfsguid/gen/api/v1;apiv1";
+
+service FilesystemService {
+  // Tracked filesystem management
+  rpc AddFilesystem(AddFilesystemRequest) returns (AddFilesystemResponse) {}
+  rpc RemoveFilesystem(RemoveFilesystemRequest) returns (RemoveFilesystemResponse) {}
+  rpc ListTrackedFilesystems(ListTrackedFilesystemsRequest) returns (ListTrackedFilesystemsResponse) {}
+  rpc UpdateFilesystem(UpdateFilesystemRequest) returns (UpdateFilesystemResponse) {}
+
+  // Error monitoring
+  rpc GetErrors(GetErrorsRequest) returns (GetErrorsResponse) {}
+  rpc GetAllErrors(GetAllErrorsRequest) returns (GetAllErrorsResponse) {}
+  rpc StreamErrors(StreamErrorsRequest) returns (stream FilesystemError) {}
+  rpc GetDeviceStats(GetDeviceStatsRequest) returns (GetDeviceStatsResponse) {}
+  rpc GetAllDeviceStats(GetAllDeviceStatsRequest) returns (GetAllDeviceStatsResponse) {}
+
+  // Filesystem usage stats
+  rpc GetFilesystemUsage(GetFilesystemUsageRequest) returns (GetFilesystemUsageResponse) {}
+  rpc GetAllFilesystemUsage(GetAllFilesystemUsageRequest) returns (GetAllFilesystemUsageResponse) {}
+}
+
+message FilesystemError {
+  string device = 1;
+  string error_type = 2;
+  string message = 3;
+  int64 timestamp = 4;
+  int64 inode = 5;
+  string path = 6;
+}
+
+message GetErrorsRequest {
+  int32 limit = 1;
+  int64 since = 2;
+  string device = 3;
+}
+
+message GetErrorsResponse {
+  repeated FilesystemError errors = 1;
+  int64 total_count = 2;
+}
+
+message StreamErrorsRequest {
+  string device = 1;
+}
+
+message DeviceStats {
+  string device_path = 1;
+  int64 total_bytes = 2;
+  int64 used_bytes = 3;
+  int64 free_bytes = 4;
+  string device_id = 5;
+  int64 write_errors = 6;
+  int64 read_errors = 7;
+  int64 flush_errors = 8;
+  int64 corruption_errors = 9;
+  int64 generation_errors = 10;
+}
+
+message GetDeviceStatsRequest {
+  string device_path = 1;
+}
+
+message GetDeviceStatsResponse {
+  repeated DeviceStats devices = 1;
+}
+
+// Tracked filesystem messages
+message TrackedFilesystem {
+  int64 id = 1;
+  string path = 2;
+  string label = 3;
+  int64 created_at = 4;
+  int64 updated_at = 5;
+  string btrbk_snapshot_dir = 6;
+  string uuid = 7;  // btrfs filesystem UUID - the primary identifier
+}
+
+message AddFilesystemRequest {
+  string path = 1;
+  string label = 2;
+  string btrbk_snapshot_dir = 3;
+}
+
+message AddFilesystemResponse {
+  TrackedFilesystem filesystem = 1;
+}
+
+message RemoveFilesystemRequest {
+  int64 id = 1;
+}
+
+message RemoveFilesystemResponse {
+  bool success = 1;
+}
+
+message ListTrackedFilesystemsRequest {}
+
+message ListTrackedFilesystemsResponse {
+  repeated TrackedFilesystem filesystems = 1;
+}
+
+message UpdateFilesystemRequest {
+  int64 id = 1;
+  string label = 2;
+  string btrbk_snapshot_dir = 3;
+}
+
+message UpdateFilesystemResponse {
+  TrackedFilesystem filesystem = 1;
+}
+
+// Get errors/stats for all tracked filesystems
+message GetAllErrorsRequest {
+  int32 limit = 1;
+  int64 since = 2;
+}
+
+message FilesystemErrors {
+  string path = 1;
+  repeated FilesystemError errors = 2;
+  string error_message = 3;  // If there was an error fetching
+}
+
+message GetAllErrorsResponse {
+  repeated FilesystemErrors filesystems = 1;
+}
+
+message GetAllDeviceStatsRequest {}
+
+message FilesystemDeviceStats {
+  string path = 1;
+  repeated DeviceStats devices = 2;
+  string error_message = 3;  // If there was an error fetching
+}
+
+message GetAllDeviceStatsResponse {
+  repeated FilesystemDeviceStats filesystems = 1;
+}
+
+// Per-device allocation within an allocation group
+message DeviceAllocation {
+  string device_path = 1;
+  int64 size = 2;  // Bytes allocated on this device for this group
+}
+
+// Allocation group (Data, Metadata, System, GlobalReserve)
+message AllocationGroup {
+  string type = 1;     // "Data", "Metadata", "System", "GlobalReserve"
+  string profile = 2;  // "single", "DUP", "RAID1", "RAID1C3", etc.
+  int64 size = 3;      // Total allocated for this type
+  int64 used = 4;      // Actually used
+  repeated DeviceAllocation devices = 5;  // Per-device breakdown
+}
+
+// Overall filesystem usage stats
+message FilesystemUsage {
+  int64 device_size = 1;         // Total raw device size
+  int64 device_allocated = 2;    // Space allocated to chunks
+  int64 device_unallocated = 3;  // Space not yet allocated
+  int64 device_slack = 4;        // Slack space
+  int64 used = 5;                // Actual data used
+  int64 free_estimated = 6;      // Free space estimate (accounting for RAID ratio)
+  string data_ratio = 7;         // e.g., "2.00" for RAID1
+  string metadata_ratio = 8;     // e.g., "3.00" for RAID1C3
+  int64 global_reserve = 9;      // Global reserve size
+  int64 global_reserve_used = 10; // Global reserve used
+  repeated AllocationGroup allocations = 11;  // Data/Metadata/System allocations
+  int64 free_statfs = 12;        // Free space from statfs/df
+}
+
+message GetFilesystemUsageRequest {
+  string device_path = 1;
+}
+
+message GetFilesystemUsageResponse {
+  FilesystemUsage usage = 1;
+}
+
+message GetAllFilesystemUsageRequest {}
+
+message FilesystemUsageInfo {
+  string path = 1;
+  FilesystemUsage usage = 2;
+  string error_message = 3;  // If there was an error fetching
+}
+
+message GetAllFilesystemUsageResponse {
+  repeated FilesystemUsageInfo filesystems = 1;
+}

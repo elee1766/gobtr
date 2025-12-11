@@ -1,0 +1,105 @@
+syntax = "proto3";
+
+package api.v1;
+
+option go_package = "github.com/elee1766/btrfsguid/gen/api/v1;apiv1";
+
+service UsageService {
+  // StartSampling starts or resumes a sampling session for a filesystem
+  rpc StartSampling(StartSamplingRequest) returns (StartSamplingResponse) {}
+
+  // StopSampling stops an active sampling session
+  rpc StopSampling(StopSamplingRequest) returns (StopSamplingResponse) {}
+
+  // GetSamplingStatus gets the current status of a sampling session
+  rpc GetSamplingStatus(GetSamplingStatusRequest) returns (GetSamplingStatusResponse) {}
+
+  // ClearSampling clears/deletes a sampling session
+  rpc ClearSampling(ClearSamplingRequest) returns (ClearSamplingResponse) {}
+
+  // GetUsageTree returns the usage tree for a path
+  rpc GetUsageTree(GetUsageTreeRequest) returns (GetUsageTreeResponse) {}
+
+  // StreamSamplingProgress streams sampling updates
+  rpc StreamSamplingProgress(StreamSamplingProgressRequest) returns (stream SamplingProgress) {}
+}
+
+message StartSamplingRequest {
+  string fs_path = 1;         // Filesystem mount path
+  bool resume = 2;            // Resume existing session if available
+  uint64 target_samples = 3;  // Target number of samples (0 = use server default)
+}
+
+message StartSamplingResponse {
+  bool started = 1;
+  bool resumed = 2;           // True if resumed existing session
+  uint64 existing_samples = 3; // Number of samples if resumed
+}
+
+message StopSamplingRequest {
+  string fs_path = 1;
+}
+
+message StopSamplingResponse {
+  bool stopped = 1;
+  uint64 total_samples = 2;
+}
+
+message GetSamplingStatusRequest {
+  string fs_path = 1;
+}
+
+message SamplingProgress {
+  bool is_running = 1;
+  uint64 sample_count = 2;
+  uint64 total_size = 3;      // Filesystem total size in bytes
+  int64 started_at = 4;       // Unix timestamp (deprecated, use running_time_seconds)
+  int64 last_updated = 5;     // Unix timestamp (deprecated, use running_time_seconds)
+  double samples_per_second = 6;
+  string current_path = 7;    // Current path being sampled (for UI feedback)
+  repeated string recent_paths = 8; // Recent sampled paths for animation
+  int64 running_time_seconds = 9; // Cumulative running time in seconds
+}
+
+message GetSamplingStatusResponse {
+  SamplingProgress progress = 1;
+  bool has_session = 2;       // True if a session exists (running or not)
+  string session_id = 3;      // Unique ID for the current session
+}
+
+message ClearSamplingRequest {
+  string fs_path = 1;
+}
+
+message ClearSamplingResponse {
+  bool cleared = 1;
+}
+
+message GetUsageTreeRequest {
+  string fs_path = 1;         // Filesystem mount path
+  string path = 2;            // Path within the filesystem to get children for (empty = root)
+  string sort_by = 3;         // "size", "name", "samples" (default: size)
+  bool sort_desc = 4;         // Sort descending (default: true)
+  int32 limit = 5;            // Max children to return (default: 100)
+}
+
+message StreamSamplingProgressRequest {
+  string fs_path = 1;
+}
+
+message UsageNode {
+  string name = 1;
+  string full_path = 2;
+  bool is_dir = 3;
+  uint64 samples = 4;
+  uint64 estimated_size = 5;  // Estimated size based on sampling
+  double percentage = 6;      // Percentage of parent
+  int32 child_count = 7;      // Number of children (for UI to show expand icon)
+}
+
+message GetUsageTreeResponse {
+  repeated UsageNode children = 1;
+  UsageNode current = 2;      // Info about the current path
+  uint64 total_samples = 3;   // Total samples in session
+  uint64 total_size = 4;      // Total filesystem size
+}

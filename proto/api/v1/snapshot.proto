@@ -1,0 +1,60 @@
+syntax = "proto3";
+
+package api.v1;
+
+option go_package = "github.com/elee1766/btrfsguid/gen/api/v1;apiv1";
+
+service SnapshotService {
+  rpc ListSnapshots(ListSnapshotsRequest) returns (ListSnapshotsResponse) {}
+  rpc ListAllSnapshots(ListAllSnapshotsRequest) returns (ListAllSnapshotsResponse) {}
+  rpc CreateSnapshot(CreateSnapshotRequest) returns (CreateSnapshotResponse) {}
+  rpc DeleteSnapshot(DeleteSnapshotRequest) returns (DeleteSnapshotResponse) {}
+}
+
+message Snapshot {
+  string id = 1;
+  string path = 2;
+  int64 created_at = 3;
+  bool is_readonly = 4;
+  string parent_uuid = 5;
+  int64 size_bytes = 6;
+}
+
+message ListSnapshotsRequest {
+  string subvolume_path = 1;
+}
+
+message ListSnapshotsResponse {
+  repeated Snapshot snapshots = 1;
+}
+
+message CreateSnapshotRequest {
+  string source_path = 1;
+  string snapshot_name = 2;
+  bool readonly = 3;
+}
+
+message CreateSnapshotResponse {
+  Snapshot snapshot = 1;
+}
+
+message DeleteSnapshotRequest {
+  string snapshot_path = 1;
+}
+
+message DeleteSnapshotResponse {
+  bool success = 1;
+}
+
+// List snapshots from all tracked filesystems
+message ListAllSnapshotsRequest {}
+
+message FilesystemSnapshots {
+  string path = 1;
+  repeated Snapshot snapshots = 2;
+  string error_message = 3;  // If there was an error fetching
+}
+
+message ListAllSnapshotsResponse {
+  repeated FilesystemSnapshots filesystems = 1;
+}
