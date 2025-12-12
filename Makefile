@@ -3,7 +3,7 @@
 all: build
 
 # Build both web and server (development - serves from disk)
-build: web server
+build: web server setcap
 
 # Build web frontend (Solid + Vite)
 web:

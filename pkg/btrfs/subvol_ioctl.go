@@ -110,6 +110,378 @@ type btrfsIoctlInoLookupArgs struct {
 
 var ioctlInoLookup = ioctl.IOWR(btrfsIoctlMagic, 18, unsafe.Sizeof(btrfsIoctlInoLookupArgs{}))
 
+// BTRFS_DEVICE_PATH_NAME_MAX from kernel headers
+const devicePathNameMax = 1024
+
+// btrfsIoctlDevInfoArgs for BTRFS_IOC_DEV_INFO
+type btrfsIoctlDevInfoArgs struct {
+	DevID      uint64
+	UUID       [16]byte
+	BytesUsed  uint64
+	TotalBytes uint64
+	FSID       [16]byte
+	Unused     [377]uint64
+	Path       [devicePathNameMax]byte
+}
+
+var ioctlDevInfo = ioctl.IOWR(btrfsIoctlMagic, 30, unsafe.Sizeof(btrfsIoctlDevInfoArgs{}))
+
+// btrfsIoctlSpaceInfo for BTRFS_IOC_SPACE_INFO results
+type btrfsIoctlSpaceInfo struct {
+	Flags      uint64
+	TotalBytes uint64
+	UsedBytes  uint64
+}
+
+// btrfsIoctlSpaceArgs for BTRFS_IOC_SPACE_INFO
+type btrfsIoctlSpaceArgs struct {
+	SpaceSlots  uint64
+	TotalSpaces uint64
+}
+
+var ioctlSpaceInfo = ioctl.IOWR(btrfsIoctlMagic, 20, unsafe.Sizeof(btrfsIoctlSpaceArgs{}))
+
+// Block group type flags
+const (
+	BlockGroupData     = 1 << 0
+	BlockGroupSystem   = 1 << 1
+	BlockGroupMetadata = 1 << 2
+	BlockGroupRaid0    = 1 << 3
+	BlockGroupRaid1    = 1 << 4
+	BlockGroupDup      = 1 << 5
+	BlockGroupRaid10   = 1 << 6
+	BlockGroupRaid5    = 1 << 7
+	BlockGroupRaid6    = 1 << 8
+	BlockGroupRaid1C3  = 1 << 9
+	BlockGroupRaid1C4  = 1 << 10
+)
+
+// DeviceInfoIoctl contains device info from ioctl
+type DeviceInfoIoctl struct {
+	DevID      uint64
+	UUID       string
+	BytesUsed  uint64
+	TotalBytes uint64
+	Path       string
+}
+
+// SpaceInfoIoctl contains space allocation info from ioctl
+type SpaceInfoIoctl struct {
+	Type       string // "Data", "Metadata", "System", "unknown"
+	Profile    string // "single", "DUP", "RAID1", etc.
+	TotalBytes uint64
+	UsedBytes  uint64
+}
+
+// GetDeviceInfo gets device info via BTRFS_IOC_DEV_INFO
+func GetDeviceInfo(path string, devID uint64) (*DeviceInfoIoctl, error) {
+	f, err := os.OpenFile(path, os.O_RDONLY, 0)
+	if err != nil {
+		return nil, fmt.Errorf("open path: %w", err)
+	}
+	defer f.Close()
+
+	var args btrfsIoctlDevInfoArgs
+	args.DevID = devID
+
+	if err := ioctl.Do(f, ioctlDevInfo, &args); err != nil {
+		return nil, fmt.Errorf("DEV_INFO ioctl: %w", err)
+	}
+
+	// Find null terminator in path
+	pathLen := 0
+	for i, b := range args.Path {
+		if b == 0 {
+			pathLen = i
+			break
+		}
+	}
+
+	return &DeviceInfoIoctl{
+		DevID:      args.DevID,
+		UUID:       formatUUID(args.UUID),
+		BytesUsed:  args.BytesUsed,
+		TotalBytes: args.TotalBytes,
+		Path:       string(args.Path[:pathLen]),
+	}, nil
+}
+
+// GetAllDeviceInfo gets info for all devices in a filesystem
+func GetAllDeviceInfo(path string) ([]*DeviceInfoIoctl, error) {
+	f, err := os.OpenFile(path, os.O_RDONLY, 0)
+	if err != nil {
+		return nil, fmt.Errorf("open path: %w", err)
+	}
+	defer f.Close()
+
+	return getAllDeviceInfoFromFile(f)
+}
+
+// GetFilesystemAndDeviceInfo gets both filesystem info and device info in a single file open
+func GetFilesystemAndDeviceInfo(path string) (*FilesystemInfo, []*DeviceInfoIoctl, error) {
+	f, err := os.OpenFile(path, os.O_RDONLY, 0)
+	if err != nil {
+		return nil, nil, fmt.Errorf("open path: %w", err)
+	}
+	defer f.Close()
+
+	// Get filesystem info
+	var fsArgs btrfsIoctlFsInfoArgs
+	if err := ioctl.Do(f, ioctlFsInfo, &fsArgs); err != nil {
+		return nil, nil, fmt.Errorf("FS_INFO ioctl: %w", err)
+	}
+
+	fsInfo := &FilesystemInfo{
+		UUID:       formatUUID(fsArgs.FSID),
+		NumDevices: fsArgs.NumDevices,
+		NodeSize:   fsArgs.NodeSize,
+		SectorSize: fsArgs.SectorSize,
+		Generation: fsArgs.Generation,
+	}
+	if !isZeroUUID(fsArgs.MetadataUUID) && fsArgs.MetadataUUID != fsArgs.FSID {
+		fsInfo.MetadataUUID = formatUUID(fsArgs.MetadataUUID)
+	}
+
+	// Get device info using the same file handle and fsArgs
+	var devices []*DeviceInfoIoctl
+	for devID := uint64(1); devID <= fsArgs.MaxID; devID++ {
+		var args btrfsIoctlDevInfoArgs
+		args.DevID = devID
+
+		if err := ioctl.Do(f, ioctlDevInfo, &args); err != nil {
+			continue // Device ID doesn't exist
+		}
+
+		pathLen := 0
+		for i, b := range args.Path {
+			if b == 0 {
+				pathLen = i
+				break
+			}
+		}
+
+		devices = append(devices, &DeviceInfoIoctl{
+			DevID:      args.DevID,
+			UUID:       formatUUID(args.UUID),
+			BytesUsed:  args.BytesUsed,
+			TotalBytes: args.TotalBytes,
+			Path:       string(args.Path[:pathLen]),
+		})
+
+		if uint64(len(devices)) >= fsArgs.NumDevices {
+			break
+		}
+	}
+
+	return fsInfo, devices, nil
+}
+
+// getAllDeviceInfoFromFile gets device info using an already-open file handle
+func getAllDeviceInfoFromFile(f *os.File) ([]*DeviceInfoIoctl, error) {
+	// Get filesystem info to know max device ID and count
+	var fsInfoArgs btrfsIoctlFsInfoArgs
+	if err := ioctl.Do(f, ioctlFsInfo, &fsInfoArgs); err != nil {
+		return nil, fmt.Errorf("FS_INFO ioctl: %w", err)
+	}
+
+	var devices []*DeviceInfoIoctl
+
+	for devID := uint64(1); devID <= fsInfoArgs.MaxID; devID++ {
+		var args btrfsIoctlDevInfoArgs
+		args.DevID = devID
+
+		if err := ioctl.Do(f, ioctlDevInfo, &args); err != nil {
+			continue // Device ID doesn't exist
+		}
+
+		// Find null terminator in path
+		pathLen := 0
+		for i, b := range args.Path {
+			if b == 0 {
+				pathLen = i
+				break
+			}
+		}
+
+		devices = append(devices, &DeviceInfoIoctl{
+			DevID:      args.DevID,
+			UUID:       formatUUID(args.UUID),
+			BytesUsed:  args.BytesUsed,
+			TotalBytes: args.TotalBytes,
+			Path:       string(args.Path[:pathLen]),
+		})
+
+		if uint64(len(devices)) >= fsInfoArgs.NumDevices {
+			break
+		}
+	}
+
+	return devices, nil
+}
+
+// GetSpaceInfo gets space allocation info via BTRFS_IOC_SPACE_INFO
+func GetSpaceInfo(path string) ([]*SpaceInfoIoctl, error) {
+	f, err := os.OpenFile(path, os.O_RDONLY, 0)
+	if err != nil {
+		return nil, fmt.Errorf("open path: %w", err)
+	}
+	defer f.Close()
+
+	// First call to get number of spaces
+	var args btrfsIoctlSpaceArgs
+	if err := ioctl.Do(f, ioctlSpaceInfo, &args); err != nil {
+		return nil, fmt.Errorf("SPACE_INFO ioctl (count): %w", err)
+	}
+
+	if args.TotalSpaces == 0 {
+		return nil, nil
+	}
+
+	// Allocate buffer for full results
+	// The ioctl returns btrfsIoctlSpaceArgs followed by TotalSpaces * btrfsIoctlSpaceInfo
+	bufSize := 16 + args.TotalSpaces*24 // 16 bytes header + 24 bytes per space info
+	buf := make([]byte, bufSize)
+
+	// Set space_slots to request all spaces
+	binary.LittleEndian.PutUint64(buf[0:8], args.TotalSpaces)
+
+	// Make the ioctl call with raw buffer
+	if err := ioctlRaw(f, ioctlSpaceInfo, buf); err != nil {
+		return nil, fmt.Errorf("SPACE_INFO ioctl (data): %w", err)
+	}
+
+	// Parse results
+	totalSpaces := binary.LittleEndian.Uint64(buf[8:16])
+	var spaces []*SpaceInfoIoctl
+
+	for i := uint64(0); i < totalSpaces; i++ {
+		offset := 16 + i*24
+		flags := binary.LittleEndian.Uint64(buf[offset : offset+8])
+		total := binary.LittleEndian.Uint64(buf[offset+8 : offset+16])
+		used := binary.LittleEndian.Uint64(buf[offset+16 : offset+24])
+
+		spaces = append(spaces, &SpaceInfoIoctl{
+			Type:       getBlockGroupType(flags),
+			Profile:    getBlockGroupProfile(flags),
+			TotalBytes: total,
+			UsedBytes:  used,
+		})
+	}
+
+	return spaces, nil
+}
+
+// ioctlRaw performs an ioctl with a raw byte buffer
+func ioctlRaw(f *os.File, req uintptr, buf []byte) error {
+	return ioctl.Do(f, req, unsafe.Pointer(&buf[0]))
+}
+
+func getBlockGroupType(flags uint64) string {
+	if flags&BlockGroupData != 0 {
+		return "Data"
+	}
+	if flags&BlockGroupMetadata != 0 {
+		return "Metadata"
+	}
+	if flags&BlockGroupSystem != 0 {
+		return "System"
+	}
+	return "unknown"
+}
+
+// btrfsIoctlBalanceArgs for BTRFS_IOC_BALANCE_PROGRESS
+type btrfsIoctlBalanceArgs struct {
+	Flags uint64
+	State uint64
+	Data  btrfsBalanceArgs
+	Meta  btrfsBalanceArgs
+	Sys   btrfsBalanceArgs
+}
+
+type btrfsBalanceArgs struct {
+	Profiles    uint64
+	Usage       uint64
+	UsageMin    uint32
+	UsageMax    uint32
+	Devid       uint64
+	PStart      uint64
+	PEnd        uint64
+	VStart      uint64
+	VEnd        uint64
+	Target      uint64
+	Flags       uint64
+	Limit       uint64
+	LimitMin    uint32
+	LimitMax    uint32
+	Stripes     uint32
+	StripesMin  uint32
+	StripesMax  uint32
+	Unused      [6]uint64
+}
+
+// Balance state flags
+const (
+	BalanceStateRunning = 1 << 0
+	BalanceStatePauseReq = 1 << 1
+	BalanceStateCancelReq = 1 << 2
+)
+
+var ioctlBalanceProgress = ioctl.IOWR(btrfsIoctlMagic, 34, unsafe.Sizeof(btrfsIoctlBalanceArgs{}))
+
+// BalanceProgressIoctl contains balance progress from ioctl
+type BalanceProgressIoctl struct {
+	IsRunning bool
+	IsPaused  bool
+	State     uint64
+}
+
+// GetBalanceProgress gets balance progress via BTRFS_IOC_BALANCE_PROGRESS
+func GetBalanceProgress(path string) (*BalanceProgressIoctl, error) {
+	f, err := os.OpenFile(path, os.O_RDONLY, 0)
+	if err != nil {
+		return nil, fmt.Errorf("open path: %w", err)
+	}
+	defer f.Close()
+
+	var args btrfsIoctlBalanceArgs
+	if err := ioctl.Do(f, ioctlBalanceProgress, &args); err != nil {
+		// ENOTCONN means no balance running
+		return &BalanceProgressIoctl{
+			IsRunning: false,
+			IsPaused:  false,
+		}, nil
+	}
+
+	return &BalanceProgressIoctl{
+		IsRunning: args.State&BalanceStateRunning != 0,
+		IsPaused:  args.State&BalanceStatePauseReq != 0,
+		State:     args.State,
+	}, nil
+}
+
+func getBlockGroupProfile(flags uint64) string {
+	switch {
+	case flags&BlockGroupRaid1C4 != 0:
+		return "RAID1C4"
+	case flags&BlockGroupRaid1C3 != 0:
+		return "RAID1C3"
+	case flags&BlockGroupRaid6 != 0:
+		return "RAID6"
+	case flags&BlockGroupRaid5 != 0:
+		return "RAID5"
+	case flags&BlockGroupRaid10 != 0:
+		return "RAID10"
+	case flags&BlockGroupRaid1 != 0:
+		return "RAID1"
+	case flags&BlockGroupRaid0 != 0:
+		return "RAID0"
+	case flags&BlockGroupDup != 0:
+		return "DUP"
+	default:
+		return "single"
+	}
+}
+
 // FilesystemInfo contains basic filesystem info from ioctl
 type FilesystemInfo struct {
 	UUID         string

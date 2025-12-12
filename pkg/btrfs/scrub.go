@@ -7,7 +7,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"regexp"
 	"strconv"
 	"strings"
 	"syscall"
@@ -128,184 +127,94 @@ func (m *Manager) CancelScrub(devicePath string) error {
 	return nil
 }
 
-// GetScrubStatus gets the current scrub status
+// GetScrubStatus gets the current scrub status for a filesystem mount path.
+// It first gets the filesystem UUID and tries to read from the status file,
+// then checks if a scrub is currently running using process detection.
 func (m *Manager) GetScrubStatus(devicePath string) (*ScrubStatus, error) {
-	// Get raw stats with -R flag
-	cmd := exec.Command("btrfs", "scrub", "status", "-R", devicePath)
-	var out bytes.Buffer
-	cmd.Stdout = &out
-	cmd.Stderr = &out
-
-	if err := cmd.Run(); err != nil {
-		m.logger.Error("failed to get scrub status", "error", err, "output", out.String())
-		return nil, fmt.Errorf("btrfs scrub status failed: %w", err)
+	// Get filesystem UUID first
+	fsInfo, err := GetFilesystemInfo(devicePath)
+	if err != nil {
+		return nil, fmt.Errorf("get filesystem info: %w", err)
 	}
 
-	status, err := m.parseScrubStatus(out.String(), devicePath)
+	// Read status from file
+	status, err := m.GetScrubStatusByUUID(fsInfo.UUID)
 	if err != nil {
 		return nil, err
 	}
 
-	// Get human-readable output for TotalBytes (only shown without -R)
-	cmd2 := exec.Command("btrfs", "scrub", "status", devicePath)
-	var out2 bytes.Buffer
-	cmd2.Stdout = &out2
-	cmd2.Stderr = &out2
+	// Check if scrub is currently running by looking for scrub process
+	// The status file alone can't tell us if a scrub is actively running
+	if status.Status == "unknown" || status.Status == "" {
+		// Try to detect if scrub is running by checking /proc for btrfs scrub processes
+		isRunning := m.isScrubProcessRunning(devicePath)
+		if isRunning {
+			status.IsRunning = true
+			status.Status = "running"
+		}
+	}
 
-	if err := cmd2.Run(); err == nil {
-		m.parseHumanScrubStatus(out2.String(), status)
+	// Get total bytes for the filesystem (for progress calculation)
+	if status.TotalBytes == 0 {
+		usage, err := m.GetFilesystemUsage(devicePath)
+		if err == nil {
+			status.TotalBytes = usage.DeviceSize
+		}
+	}
+
+	// Calculate rate and ETA if running
+	if status.IsRunning && status.DurationSeconds > 0 && status.BytesScrubbed > 0 {
+		status.RateBytesPerSec = status.BytesScrubbed / status.DurationSeconds
+		if status.RateBytesPerSec > 0 && status.TotalBytes > status.BytesScrubbed {
+			status.EtaSeconds = (status.TotalBytes - status.BytesScrubbed) / status.RateBytesPerSec
+		}
 	}
 
 	return status, nil
 }
 
-func (m *Manager) parseScrubStatus(output, devicePath string) (*ScrubStatus, error) {
-	status := &ScrubStatus{}
-
-	if strings.Contains(output, "no stats available") || strings.Contains(output, "never run") {
-		status.Status = "never_run"
-		return status, nil
+// isScrubProcessRunning checks if a btrfs scrub process is running for the given path
+func (m *Manager) isScrubProcessRunning(devicePath string) bool {
+	// Read /proc to find btrfs scrub processes
+	// This is a heuristic - we look for processes with "btrfs" and "scrub" in cmdline
+	entries, err := os.ReadDir("/proc")
+	if err != nil {
+		return false
 	}
 
-	// Parse UUID
-	uuidRe := regexp.MustCompile(`UUID:\s+([0-9a-f-]+)`)
-	if matches := uuidRe.FindStringSubmatch(output); len(matches) == 2 {
-		status.UUID = matches[1]
-	}
-
-	// Check status
-	statusRe := regexp.MustCompile(`Status:\s+(\w+)`)
-	if matches := statusRe.FindStringSubmatch(output); len(matches) == 2 {
-		status.Status = strings.ToLower(matches[1])
-		status.IsRunning = status.Status == "running"
-	} else {
-		// Fallback to text-based detection
-		if strings.Contains(output, "running") {
-			status.IsRunning = true
-			status.Status = "running"
-		} else if strings.Contains(output, "finished") {
-			status.Status = "finished"
-		} else if strings.Contains(output, "aborted") {
-			status.Status = "aborted"
-		} else {
-			status.Status = "unknown"
+	for _, entry := range entries {
+		if !entry.IsDir() {
+			continue
 		}
-	}
-
-	// Helper to parse int64 values
-	parseInt64 := func(pattern string) int64 {
-		re := regexp.MustCompile(pattern + `:\s+(\d+)`)
-		if matches := re.FindStringSubmatch(output); len(matches) == 2 {
-			val, _ := strconv.ParseInt(matches[1], 10, 64)
-			return val
-		}
-		return 0
-	}
-
-	// Helper to parse int32 values
-	parseInt32 := func(pattern string) int32 {
-		return int32(parseInt64(pattern))
-	}
-
-	// Parse all statistics
-	status.DataBytesScrubbed = parseInt64("data_bytes_scrubbed")
-	status.TreeBytesScrubbed = parseInt64("tree_bytes_scrubbed")
-	status.DataExtentsScrubbed = parseInt64("data_extents_scrubbed")
-	status.TreeExtentsScrubbed = parseInt64("tree_extents_scrubbed")
-	status.ReadErrors = parseInt32("read_errors")
-	status.CsumErrors = parseInt32("csum_errors")
-	status.VerifyErrors = parseInt32("verify_errors")
-	status.NoCsum = parseInt64("no_csum")
-	status.CsumDiscards = parseInt64("csum_discards")
-	status.SuperErrors = parseInt32("super_errors")
-	status.MallocErrors = parseInt32("malloc_errors")
-	status.UncorrectableErrors = parseInt32("uncorrectable_errors")
-	status.UnverifiedErrors = parseInt32("unverified_errors")
-	status.CorrectedErrors = parseInt32("corrected_errors")
-	status.LastPhysical = parseInt64("last_physical")
-
-	// Calculate total bytes scrubbed
-	status.BytesScrubbed = status.DataBytesScrubbed + status.TreeBytesScrubbed
-
-	// Calculate data errors (for backwards compatibility)
-	status.DataErrors = status.ReadErrors + status.CsumErrors + status.VerifyErrors
-
-	// Parse duration (format: "0:02:03" for H:MM:SS)
-	durationRe := regexp.MustCompile(`Duration:\s+(\d+):(\d+):(\d+)`)
-	if matches := durationRe.FindStringSubmatch(output); len(matches) == 4 {
-		hours, _ := strconv.ParseInt(matches[1], 10, 64)
-		mins, _ := strconv.ParseInt(matches[2], 10, 64)
-		secs, _ := strconv.ParseInt(matches[3], 10, 64)
-		status.DurationSeconds = hours*3600 + mins*60 + secs
-		status.Duration = fmt.Sprintf("%d:%02d:%02d", hours, mins, secs)
-	}
-
-	// Parse start timestamp (format: "Mon Aug 18 21:02:02 2025")
-	startRe := regexp.MustCompile(`Scrub started:\s+(.+)`)
-	if matches := startRe.FindStringSubmatch(output); len(matches) == 2 {
-		timeStr := strings.TrimSpace(matches[1])
-		// Try multiple formats
-		formats := []string{
-			"Mon Jan 2 15:04:05 2006",
-			"Mon Jan 02 15:04:05 2006",
-		}
-		for _, format := range formats {
-			if t, err := time.Parse(format, timeStr); err == nil {
-				status.StartedAt = t
+		// Check if directory name is a PID (all digits)
+		pid := entry.Name()
+		isNum := true
+		for _, c := range pid {
+			if c < '0' || c > '9' {
+				isNum = false
 				break
+			}
+		}
+		if !isNum {
+			continue
+		}
+
+		// Read cmdline
+		cmdline, err := os.ReadFile(filepath.Join("/proc", pid, "cmdline"))
+		if err != nil {
+			continue
+		}
+
+		cmdStr := string(cmdline)
+		if strings.Contains(cmdStr, "btrfs") && strings.Contains(cmdStr, "scrub") {
+			// Check if this scrub is for our device
+			if strings.Contains(cmdStr, devicePath) {
+				return true
 			}
 		}
 	}
 
-	// Calculate finished time from start + duration
-	if !status.StartedAt.IsZero() && status.DurationSeconds > 0 && status.Status != "running" {
-		status.FinishedAt = status.StartedAt.Add(time.Duration(status.DurationSeconds) * time.Second)
-	}
-
-	return status, nil
-}
-
-// parseHumanScrubStatus extracts info from human-readable output (without -R)
-func (m *Manager) parseHumanScrubStatus(output string, status *ScrubStatus) {
-	// Helper to parse human-readable byte values like "2.59TiB" or "320.43MiB/s"
-	parseHumanBytes := func(value string, unit string) int64 {
-		val, _ := strconv.ParseFloat(value, 64)
-		multiplier := float64(1)
-		switch unit {
-		case "KiB", "KB":
-			multiplier = 1024
-		case "MiB", "MB":
-			multiplier = 1024 * 1024
-		case "GiB", "GB":
-			multiplier = 1024 * 1024 * 1024
-		case "TiB", "TB":
-			multiplier = 1024 * 1024 * 1024 * 1024
-		case "PiB", "PB":
-			multiplier = 1024 * 1024 * 1024 * 1024 * 1024
-		}
-		return int64(val * multiplier)
-	}
-
-	// Parse "Total to scrub: 2.59TiB"
-	totalRe := regexp.MustCompile(`Total to scrub:\s+([\d.]+)([KMGTP]i?B)`)
-	if matches := totalRe.FindStringSubmatch(output); len(matches) == 3 {
-		status.TotalBytes = parseHumanBytes(matches[1], matches[2])
-	}
-
-	// Parse "Rate: 320.43MiB/s"
-	rateRe := regexp.MustCompile(`Rate:\s+([\d.]+)([KMGTP]i?B)/s`)
-	if matches := rateRe.FindStringSubmatch(output); len(matches) == 3 {
-		status.RateBytesPerSec = parseHumanBytes(matches[1], matches[2])
-	}
-
-	// Parse "ETA: 0:12:34" (H:MM:SS)
-	etaRe := regexp.MustCompile(`ETA:\s+(\d+):(\d+):(\d+)`)
-	if matches := etaRe.FindStringSubmatch(output); len(matches) == 4 {
-		hours, _ := strconv.ParseInt(matches[1], 10, 64)
-		mins, _ := strconv.ParseInt(matches[2], 10, 64)
-		secs, _ := strconv.ParseInt(matches[3], 10, 64)
-		status.EtaSeconds = hours*3600 + mins*60 + secs
-	}
+	return false
 }
 
 // IsScrubRunning checks if a scrub is currently running

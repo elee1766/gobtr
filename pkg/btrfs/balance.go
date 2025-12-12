@@ -5,9 +5,7 @@ import (
 	"context"
 	"fmt"
 	"os/exec"
-	"regexp"
 	"strconv"
-	"strings"
 	"sync"
 	"time"
 
@@ -216,67 +214,25 @@ func (m *Manager) ResumeBalance(ctx context.Context, devicePath string) error {
 	return nil
 }
 
-// GetBalanceStatus gets the current balance status
+// GetBalanceStatus gets the current balance status using ioctl
 func (m *Manager) GetBalanceStatus(devicePath string) (*BalanceStatus, error) {
-	cmd := exec.Command("btrfs", "balance", "status", devicePath)
-	var out bytes.Buffer
-	cmd.Stdout = &out
-	cmd.Stderr = &out
-
-	err := cmd.Run()
-	output := out.String()
-
-	// Balance status returns non-zero if no balance is running, which is fine
+	progress, err := GetBalanceProgress(devicePath)
 	if err != nil {
-		if strings.Contains(output, "No balance found") || strings.Contains(output, "not in progress") {
-			return &BalanceStatus{Status: "idle"}, nil
-		}
-		m.logger.Debug("balance status output", "output", output, "error", err)
+		return nil, fmt.Errorf("get balance progress: %w", err)
 	}
 
-	return m.parseBalanceStatus(output, devicePath)
-}
+	status := &BalanceStatus{
+		IsRunning: progress.IsRunning,
+		IsPaused:  progress.IsPaused,
+	}
 
-func (m *Manager) parseBalanceStatus(output, devicePath string) (*BalanceStatus, error) {
-	status := &BalanceStatus{}
-
-	if strings.Contains(output, "No balance found") || strings.Contains(output, "not in progress") {
+	if progress.IsRunning {
+		status.Status = "running"
+	} else if progress.IsPaused {
+		status.Status = "paused"
+	} else {
 		status.Status = "idle"
-		return status, nil
 	}
-
-	// Check if running or paused
-	if strings.Contains(output, "Balance on") {
-		if strings.Contains(output, "is running") {
-			status.IsRunning = true
-			status.Status = "running"
-		} else if strings.Contains(output, "is paused") {
-			status.IsPaused = true
-			status.Status = "paused"
-		}
-	}
-
-	// Parse progress: "X out of about Y chunks balanced (Z considered)"
-	// Or: "X out of about Y chunks balanced"
-	progressRe := regexp.MustCompile(`(\d+)\s+out of about\s+(\d+)\s+chunks balanced(?:\s+\((\d+)\s+considered\))?`)
-	if matches := progressRe.FindStringSubmatch(output); len(matches) >= 3 {
-		status.Relocated, _ = strconv.ParseInt(matches[1], 10, 64)
-		status.TotalChunks, _ = strconv.ParseInt(matches[2], 10, 64)
-		if len(matches) >= 4 && matches[3] != "" {
-			status.Considered, _ = strconv.ParseInt(matches[3], 10, 64)
-		}
-		status.Left = status.TotalChunks - status.Relocated
-	}
-
-	// Parse soft errors
-	errRe := regexp.MustCompile(`(\d+)\s+soft error`)
-	if matches := errRe.FindStringSubmatch(output); len(matches) == 2 {
-		val, _ := strconv.ParseInt(matches[1], 10, 32)
-		status.SoftErrors = int32(val)
-	}
-
-	// Parse expected time remaining if present
-	// "expected to finish in X hour(s), Y minute(s)"
 
 	return status, nil
 }
