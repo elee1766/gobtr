@@ -5,6 +5,7 @@ import (
 	"io/fs"
 	"log/slog"
 	"net/http"
+	"net/http/pprof"
 	"os"
 	"path/filepath"
 	"strings"
@@ -83,6 +84,14 @@ func NewServer(p ServerParams) *Server {
 	register(apiv1connect.NewSubvolumeServiceHandler(h.Subvolume))
 	register(apiv1connect.NewUsageServiceHandler(h.Usage))
 	register(apiv1connect.NewFragMapServiceHandler(h.FragMap))
+
+	// Register pprof handlers for profiling
+	mux.HandleFunc("/debug/pprof/", pprof.Index)
+	mux.HandleFunc("/debug/pprof/cmdline", pprof.Cmdline)
+	mux.HandleFunc("/debug/pprof/profile", pprof.Profile)
+	mux.HandleFunc("/debug/pprof/symbol", pprof.Symbol)
+	mux.HandleFunc("/debug/pprof/trace", pprof.Trace)
+	logger.Info("pprof endpoints enabled at /debug/pprof/")
 
 	// Serve static files with SPA fallback
 	if EmbeddedFS != nil {

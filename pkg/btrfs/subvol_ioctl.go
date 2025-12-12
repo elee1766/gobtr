@@ -346,7 +346,7 @@ func GetSpaceInfo(path string) ([]*SpaceInfoIoctl, error) {
 	binary.LittleEndian.PutUint64(buf[0:8], args.TotalSpaces)
 
 	// Make the ioctl call with raw buffer
-	if err := ioctlRaw(f, ioctlSpaceInfo, buf); err != nil {
+	if err := ioctl.Ioctl(f, ioctlSpaceInfo, uintptr(unsafe.Pointer(&buf[0]))); err != nil {
 		return nil, fmt.Errorf("SPACE_INFO ioctl (data): %w", err)
 	}
 
@@ -369,11 +369,6 @@ func GetSpaceInfo(path string) ([]*SpaceInfoIoctl, error) {
 	}
 
 	return spaces, nil
-}
-
-// ioctlRaw performs an ioctl with a raw byte buffer
-func ioctlRaw(f *os.File, req uintptr, buf []byte) error {
-	return ioctl.Do(f, req, unsafe.Pointer(&buf[0]))
 }
 
 func getBlockGroupType(flags uint64) string {
