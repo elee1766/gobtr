@@ -49,5 +49,7 @@ func provideLogger(cfg *config.Config) *slog.Logger {
 	}
 
 	handler := slog.NewJSONHandler(os.Stdout, opts)
-	return slog.New(handler)
+	logger := slog.New(handler)
+	slog.SetDefault(logger) // Set as default for package-level slog calls
+	return logger
 }

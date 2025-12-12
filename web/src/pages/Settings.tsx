@@ -46,30 +46,28 @@ export default function Settings() {
             />
           </SettingRow>
 
-          {/* Byte base */}
-          <SettingRow label="Byte Units" description="Use binary (1024, KiB) or decimal (1000, KB) units">
-            <ToggleGroup
-              options={[
-                { label: "binary", value: "binary" as ByteBase },
-                { label: "decimal", value: "decimal" as ByteBase },
-              ]}
-              value={uiSettings().byteBase}
-              onChange={setByteBase}
-            />
-          </SettingRow>
-
-          {/* Max unit */}
-          <SettingRow label="Max Unit" description="Largest unit to display (values won't exceed this)">
-            <ToggleGroup
-              options={[
-                { label: "MB", value: "MB" as ByteUnit },
-                { label: "GB", value: "GB" as ByteUnit },
-                { label: "TB", value: "TB" as ByteUnit },
-                { label: "PB", value: "PB" as ByteUnit },
-              ]}
-              value={uiSettings().maxByteUnit}
-              onChange={setMaxByteUnit}
-            />
+          {/* Byte units and max unit */}
+          <SettingRow label="Byte Units" description="Binary (1024) or decimal (1000), and max unit to display">
+            <div class="flex gap-2">
+              <ToggleGroup
+                options={[
+                  { label: "binary", value: "binary" as ByteBase },
+                  { label: "decimal", value: "decimal" as ByteBase },
+                ]}
+                value={uiSettings().byteBase}
+                onChange={setByteBase}
+              />
+              <ToggleGroup
+                options={[
+                  { label: uiSettings().byteBase === "binary" ? "MiB" : "MB", value: "MB" as ByteUnit },
+                  { label: uiSettings().byteBase === "binary" ? "GiB" : "GB", value: "GB" as ByteUnit },
+                  { label: uiSettings().byteBase === "binary" ? "TiB" : "TB", value: "TB" as ByteUnit },
+                  { label: uiSettings().byteBase === "binary" ? "PiB" : "PB", value: "PB" as ByteUnit },
+                ]}
+                value={uiSettings().maxByteUnit}
+                onChange={setMaxByteUnit}
+              />
+            </div>
           </SettingRow>
 
           {/* Auto-refresh */}

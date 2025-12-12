@@ -464,9 +464,16 @@ func selectRepresentativePath(paths []string) string {
 
 // logicalIno calls BTRFS_IOC_LOGICAL_INO to find inodes at a logical address.
 func (s *Sampler) logicalIno(logical uint64) ([]InodeResult, error) {
-	// Allocate buffer for results
-	// Each result is 3 uint64s (inum, offset, root) = 24 bytes
-	// Plus the container header
+	return logicalInoImpl(s.fsFile, logical)
+}
+
+// inodeLookup calls BTRFS_IOC_INO_LOOKUP to resolve an inode to a path.
+func (s *Sampler) inodeLookup(treeID, objectID uint64) (string, error) {
+	return inodeLookupImpl(s.fsFile, treeID, objectID)
+}
+
+// logicalInoImpl is the implementation of LOGICAL_INO ioctl.
+func logicalInoImpl(fsFile *os.File, logical uint64) ([]InodeResult, error) {
 	bufSize := 4096
 	buf := make([]byte, bufSize)
 
@@ -476,22 +483,19 @@ func (s *Sampler) logicalIno(logical uint64) ([]InodeResult, error) {
 		Inodes:  uint64(uintptr(unsafe.Pointer(&buf[0]))),
 	}
 
-	err := ioctl.Do(s.fsFile, ioctlLogicalIno, &args)
+	err := ioctl.Do(fsFile, ioctlLogicalIno, &args)
 	if err != nil {
 		return nil, err
 	}
 
-	// Parse the results from the buffer
 	container := (*btrfsDataContainer)(unsafe.Pointer(&buf[0]))
 	if container.ElemCnt == 0 {
 		return nil, nil
 	}
 
-	// Results start after the container header
 	resultStart := unsafe.Sizeof(btrfsDataContainer{})
 	results := make([]InodeResult, 0, container.ElemCnt)
 
-	// Each element is a triplet of uint64: (inum, offset, root)
 	for i := uint32(0); i < container.ElemCnt; i++ {
 		offset := int(resultStart) + int(i)*24
 		if offset+24 > len(buf) {
@@ -512,19 +516,18 @@ func (s *Sampler) logicalIno(logical uint64) ([]InodeResult, error) {
 	return results, nil
 }
 
-// inodeLookup calls BTRFS_IOC_INO_LOOKUP to resolve an inode to a path.
-func (s *Sampler) inodeLookup(treeID, objectID uint64) (string, error) {
+// inodeLookupImpl is the implementation of INO_LOOKUP ioctl.
+func inodeLookupImpl(fsFile *os.File, treeID, objectID uint64) (string, error) {
 	args := btrfsIoctlInoLookupArgs{
 		TreeID:   treeID,
 		ObjectID: objectID,
 	}
 
-	err := ioctl.Do(s.fsFile, ioctlInoLookup, &args)
+	err := ioctl.Do(fsFile, ioctlInoLookup, &args)
 	if err != nil {
 		return "", err
 	}
 
-	// Find the null terminator
 	n := 0
 	for i, b := range args.Name {
 		if b == 0 {

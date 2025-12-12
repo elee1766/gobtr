@@ -2,8 +2,10 @@ package fragmap
 
 import (
 	"fmt"
+	"log/slog"
 	"os"
 	"sort"
+	"time"
 
 	"github.com/dennwc/btrfs"
 )
@@ -37,16 +39,19 @@ func (s *Scanner) Close() error {
 
 // Scan performs a full scan of the filesystem and returns the fragmentation map
 func (s *Scanner) Scan() (*FragMap, error) {
+	totalStart := time.Now()
 	fm := &FragMap{
 		DeviceExtents: make(map[uint64][]DeviceExtent),
 	}
 
 	// Get devices
+	start := time.Now()
 	devices, err := s.scanDevices()
 	if err != nil {
 		return nil, fmt.Errorf("scan devices: %w", err)
 	}
 	fm.Devices = devices
+	slog.Debug("fragmap scan timing", "phase", "scanDevices", "duration", time.Since(start), "count", len(devices))
 
 	// Calculate total size
 	for _, dev := range devices {
@@ -54,21 +59,28 @@ func (s *Scanner) Scan() (*FragMap, error) {
 	}
 
 	// Get chunks
+	start = time.Now()
 	chunks, err := s.scanChunks()
 	if err != nil {
 		return nil, fmt.Errorf("scan chunks: %w", err)
 	}
 	fm.Chunks = chunks
+	slog.Debug("fragmap scan timing", "phase", "scanChunks", "duration", time.Since(start), "count", len(chunks))
 
 	// Get device extents
+	start = time.Now()
 	for _, dev := range devices {
+		devStart := time.Now()
 		extents, err := s.scanDeviceExtents(dev.ID)
 		if err != nil {
 			return nil, fmt.Errorf("scan device %d extents: %w", dev.ID, err)
 		}
 		fm.DeviceExtents[dev.ID] = extents
+		slog.Debug("fragmap scan timing", "phase", "scanDeviceExtents", "deviceID", dev.ID, "duration", time.Since(devStart), "count", len(extents))
 	}
+	slog.Debug("fragmap scan timing", "phase", "allDeviceExtents", "duration", time.Since(start))
 
+	slog.Debug("fragmap scan timing", "phase", "total", "duration", time.Since(totalStart))
 	return fm, nil
 }
 
@@ -76,19 +88,24 @@ func (s *Scanner) Scan() (*FragMap, error) {
 func (s *Scanner) scanDevices() ([]Device, error) {
 	// Search the chunk tree for device items
 	// Device items are stored with objectid = device id, type = DEV_ITEM_KEY
+	start := time.Now()
 	results, err := TreeSearch(s.file, ChunkTreeObjectID, 1, ^uint64(0), DevItemKey, DevItemKey, 0, ^uint64(0))
 	if err != nil {
 		return nil, err
 	}
+	slog.Debug("fragmap scan timing", "phase", "scanDevices.TreeSearch", "duration", time.Since(start))
 
 	// Open btrfs handle to get device info including path
+	start = time.Now()
 	fs, err := btrfs.Open(s.fsPath, true)
 	if err != nil {
 		return nil, fmt.Errorf("open btrfs: %w", err)
 	}
 	defer fs.Close()
+	slog.Debug("fragmap scan timing", "phase", "scanDevices.btrfs.Open", "duration", time.Since(start))
 
 	var devices []Device
+	start = time.Now()
 	for _, r := range results {
 		if r.Header.Type != DevItemKey {
 			continue
@@ -100,13 +117,16 @@ func (s *Scanner) scanDevices() ([]Device, error) {
 		}
 
 		// Get device path from btrfs
+		devInfoStart := time.Now()
 		devInfo, err := fs.GetDevInfo(dev.ID)
 		if err == nil {
 			dev.Path = devInfo.Path
 		}
+		slog.Debug("fragmap scan timing", "phase", "scanDevices.GetDevInfo", "deviceID", dev.ID, "duration", time.Since(devInfoStart))
 
 		devices = append(devices, *dev)
 	}
+	slog.Debug("fragmap scan timing", "phase", "scanDevices.parseAndGetPaths", "duration", time.Since(start))
 
 	return devices, nil
 }
@@ -115,10 +135,12 @@ func (s *Scanner) scanDevices() ([]Device, error) {
 func (s *Scanner) scanChunks() ([]Chunk, error) {
 	// Search the chunk tree for chunk items
 	// Use FirstChunkTreeObjectID as min, but max should be unlimited to get all chunks
+	start := time.Now()
 	results, err := TreeSearch(s.file, ChunkTreeObjectID, FirstChunkTreeObjectID, ^uint64(0), ChunkItemKey, ChunkItemKey, 0, ^uint64(0))
 	if err != nil {
 		return nil, err
 	}
+	slog.Debug("fragmap scan timing", "phase", "scanChunks.TreeSearch", "duration", time.Since(start), "results", len(results))
 
 	var chunks []Chunk
 	for _, r := range results {
@@ -142,11 +164,13 @@ func (s *Scanner) scanChunks() ([]Chunk, error) {
 	})
 
 	// Fetch block group usage and merge into chunks
-	blockGroups, err := s.scanBlockGroups(chunks)
+	start = time.Now()
+	blockGroups, err := s.scanBlockGroups()
 	if err != nil {
 		// Non-fatal - we can still return chunks without usage data
 		return chunks, nil
 	}
+	slog.Debug("fragmap scan timing", "phase", "scanChunks.scanBlockGroups", "duration", time.Since(start), "count", len(blockGroups))
 
 	// Create a map for quick lookup
 	bgMap := make(map[uint64]*BlockGroupItem)
@@ -166,7 +190,7 @@ func (s *Scanner) scanChunks() ([]Chunk, error) {
 
 // scanBlockGroups scans for all block groups to get usage information
 // It does a single tree search for all BLOCK_GROUP_ITEM entries in the extent tree
-func (s *Scanner) scanBlockGroups(chunks []Chunk) ([]BlockGroupItem, error) {
+func (s *Scanner) scanBlockGroups() ([]BlockGroupItem, error) {
 	// Single query to get ALL block group items from the extent tree
 	// Block groups use objectid = logical offset, type = BLOCK_GROUP_ITEM_KEY
 	// We search for all objectids (0 to max) with type = BlockGroupItemKey

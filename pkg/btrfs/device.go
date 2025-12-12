@@ -116,6 +116,12 @@ func (m *Manager) GetFilesystemUsage(path string) (*FilesystemUsage, error) {
 		return nil, fmt.Errorf("get filesystem/device info: %w", err)
 	}
 
+	// Build a map of device ID -> path for later use
+	devPathByID := make(map[uint64]string)
+	for _, dev := range devices {
+		devPathByID[dev.DevID] = dev.Path
+	}
+
 	// Calculate totals from devices
 	for _, dev := range devices {
 		usage.DeviceSize += int64(dev.TotalBytes)
@@ -123,18 +129,48 @@ func (m *Manager) GetFilesystemUsage(path string) (*FilesystemUsage, error) {
 	}
 	usage.DeviceUnallocated = usage.DeviceSize - usage.DeviceAllocated
 
+	// Get per-device chunk allocations
+	chunkAllocs, err := GetDeviceChunkAllocations(path)
+	if err != nil {
+		m.logger.Warn("failed to get device chunk allocations", "error", err)
+	}
+
+	// Aggregate per-device allocations by type+profile and device
+	// Key: "Type:Profile" -> map[devID]size
+	perDeviceByGroup := make(map[string]map[uint64]int64)
+	for _, alloc := range chunkAllocs {
+		key := alloc.Type + ":" + alloc.Profile
+		if perDeviceByGroup[key] == nil {
+			perDeviceByGroup[key] = make(map[uint64]int64)
+		}
+		perDeviceByGroup[key][alloc.DevID] += int64(alloc.Length)
+	}
+
 	// Get space allocation info via ioctl
 	spaceInfos, err := GetSpaceInfo(path)
 	if err != nil {
 		m.logger.Warn("failed to get space info via ioctl", "error", err)
 	} else {
 		for _, space := range spaceInfos {
-			usage.Allocations = append(usage.Allocations, AllocationGroup{
+			ag := AllocationGroup{
 				Type:    space.Type,
 				Profile: space.Profile,
 				Size:    int64(space.TotalBytes),
 				Used:    int64(space.UsedBytes),
-			})
+			}
+
+			// Add per-device breakdown if available
+			key := space.Type + ":" + space.Profile
+			if devSizes, ok := perDeviceByGroup[key]; ok {
+				for devID, size := range devSizes {
+					ag.Devices = append(ag.Devices, DeviceAllocation{
+						DevicePath: devPathByID[devID],
+						Size:       size,
+					})
+				}
+			}
+
+			usage.Allocations = append(usage.Allocations, ag)
 			usage.Used += int64(space.UsedBytes)
 		}
 	}
@@ -147,6 +183,13 @@ func (m *Manager) GetFilesystemUsage(path string) (*FilesystemUsage, error) {
 		if globalReserve != nil {
 			usage.GlobalReserve = globalReserve.Size
 			usage.GlobalReserveUsed = globalReserve.Reserved
+
+			// Add GlobalReserve as an allocation entry for frontend display
+			usage.Allocations = append(usage.Allocations, AllocationGroup{
+				Type: "GlobalReserve",
+				Size: globalReserve.Size,
+				Used: globalReserve.Reserved,
+			})
 		}
 
 		// Calculate ratios from sysfs data

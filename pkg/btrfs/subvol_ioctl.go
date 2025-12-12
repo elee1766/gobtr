@@ -15,14 +15,17 @@ const btrfsIoctlMagic = 0x94
 
 // Tree IDs
 const (
-	RootTreeObjectID = 1
+	RootTreeObjectID  = 1
+	DevTreeObjectID   = 4
+	ChunkTreeObjectID = 3
 )
 
 // Item key types
 const (
 	RootItemKey    = 132
-	DirItemKey     = 84
 	RootBackrefKey = 144
+	DevExtentKey   = 204
+	ChunkItemKey   = 228
 )
 
 // Special object IDs
@@ -100,15 +103,6 @@ type btrfsIoctlFsInfoArgs struct {
 }
 
 var ioctlFsInfo = ioctl.IOR(btrfsIoctlMagic, 31, unsafe.Sizeof(btrfsIoctlFsInfoArgs{}))
-
-// btrfsIoctlInoLookupArgs for BTRFS_IOC_INO_LOOKUP
-type btrfsIoctlInoLookupArgs struct {
-	TreeID   uint64
-	ObjectID uint64
-	Name     [4080]byte
-}
-
-var ioctlInoLookup = ioctl.IOWR(btrfsIoctlMagic, 18, unsafe.Sizeof(btrfsIoctlInoLookupArgs{}))
 
 // BTRFS_DEVICE_PATH_NAME_MAX from kernel headers
 const devicePathNameMax = 1024
@@ -369,6 +363,82 @@ func GetSpaceInfo(path string) ([]*SpaceInfoIoctl, error) {
 	}
 
 	return spaces, nil
+}
+
+// DeviceChunkAllocation represents a chunk allocation on a specific device
+type DeviceChunkAllocation struct {
+	DevID      uint64
+	ChunkStart uint64 // Logical address of chunk
+	Length     uint64 // Size on this device
+	Type       string // Data/Metadata/System
+	Profile    string // single/dup/raid1/etc
+}
+
+// GetDeviceChunkAllocations gets per-device chunk allocations by searching the device tree
+func GetDeviceChunkAllocations(path string) ([]*DeviceChunkAllocation, error) {
+	f, err := os.OpenFile(path, os.O_RDONLY, 0)
+	if err != nil {
+		return nil, fmt.Errorf("open path: %w", err)
+	}
+	defer f.Close()
+
+	// First, get chunk info from the chunk tree to map chunk_start -> flags
+	chunkFlags := make(map[uint64]uint64)
+	chunkResults, err := treeSearch(f, ChunkTreeObjectID, 256, ^uint64(0), ChunkItemKey, ChunkItemKey, 0, ^uint64(0))
+	if err == nil {
+		for _, res := range chunkResults {
+			if res.Header.Type == ChunkItemKey && len(res.Data) >= 32 {
+				// btrfs_chunk structure layout:
+				// offset 0: length (8 bytes)
+				// offset 8: owner (8 bytes)
+				// offset 16: stripe_len (8 bytes)
+				// offset 24: type/flags (8 bytes) - block group flags
+				chunkStart := res.Header.Offset
+				flags := binary.LittleEndian.Uint64(res.Data[24:32])
+				chunkFlags[chunkStart] = flags
+			}
+		}
+	}
+
+	// Search the device tree for dev extents
+	// Object ID is the device ID, type is DEV_EXTENT_KEY (204), offset is physical offset on device
+	results, err := treeSearch(f, DevTreeObjectID, 1, ^uint64(0), DevExtentKey, DevExtentKey, 0, ^uint64(0))
+	if err != nil {
+		return nil, fmt.Errorf("tree search for dev extents: %w", err)
+	}
+
+	var allocs []*DeviceChunkAllocation
+	for _, res := range results {
+		if res.Header.Type != DevExtentKey {
+			continue
+		}
+
+		// btrfs_dev_extent structure:
+		// chunk_tree: u64 (0-8)
+		// chunk_objectid: u64 (8-16)
+		// chunk_offset: u64 (16-24) - this is the logical chunk start
+		// length: u64 (24-32)
+		if len(res.Data) < 32 {
+			continue
+		}
+
+		chunkStart := binary.LittleEndian.Uint64(res.Data[16:24])
+		length := binary.LittleEndian.Uint64(res.Data[24:32])
+		devID := res.Header.ObjectID
+
+		// Get chunk type from the chunk flags map
+		flags := chunkFlags[chunkStart]
+
+		allocs = append(allocs, &DeviceChunkAllocation{
+			DevID:      devID,
+			ChunkStart: chunkStart,
+			Length:     length,
+			Type:       getBlockGroupType(flags),
+			Profile:    getBlockGroupProfile(flags),
+		})
+	}
+
+	return allocs, nil
 }
 
 func getBlockGroupType(flags uint64) string {

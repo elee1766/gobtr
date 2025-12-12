@@ -3,7 +3,9 @@ package fragmap
 import (
 	"encoding/binary"
 	"fmt"
+	"log/slog"
 	"os"
+	"time"
 	"unsafe"
 
 	"github.com/dennwc/ioctl"
@@ -123,6 +125,8 @@ var ioctlTreeSearch = ioctl.IOWR(btrfsIoctlMagic, 17, unsafe.Sizeof(btrfsIoctlSe
 // TreeSearch performs a tree search ioctl
 func TreeSearch(f *os.File, treeID uint64, minObjID, maxObjID uint64, minType, maxType uint32, minOffset, maxOffset uint64) ([]SearchResult, error) {
 	var results []SearchResult
+	ioctlCount := 0
+	totalIoctlTime := time.Duration(0)
 
 	args := btrfsIoctlSearchArgs{
 		Key: btrfsIoctlSearchKey{
@@ -140,7 +144,10 @@ func TreeSearch(f *os.File, treeID uint64, minObjID, maxObjID uint64, minType, m
 	}
 
 	for {
+		ioctlStart := time.Now()
 		err := ioctl.Do(f, ioctlTreeSearch, &args)
+		totalIoctlTime += time.Since(ioctlStart)
+		ioctlCount++
 		if err != nil {
 			return nil, fmt.Errorf("tree search ioctl: %w", err)
 		}
@@ -218,6 +225,7 @@ func TreeSearch(f *os.File, treeID uint64, minObjID, maxObjID uint64, minType, m
 		args.Key.NrItems = 4096
 	}
 
+	slog.Debug("TreeSearch stats", "treeID", treeID, "minType", minType, "ioctlCount", ioctlCount, "ioctlTime", totalIoctlTime, "results", len(results))
 	return results, nil
 }
 

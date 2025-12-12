@@ -19,6 +19,7 @@ require (
 	github.com/pressly/goose/v3 v3.26.0 // indirect
 	github.com/sethvargo/go-retry v0.3.0 // indirect
 	github.com/tetratelabs/wazero v1.10.1 // indirect
+	go.etcd.io/bbolt v1.4.3 // indirect
 	go.uber.org/dig v1.19.0 // indirect
 	go.uber.org/multierr v1.11.0 // indirect
 	go.uber.org/zap v1.27.1 // indirect
