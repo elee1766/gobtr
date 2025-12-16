@@ -26,9 +26,6 @@ type Config struct {
 
 	// Logging
 	LogLevel string
-
-	// BTDU
-	BTDUUseBolt bool // Use BBolt for btdu storage (lower memory, slower)
 }
 
 // New creates a new Config with values from environment or defaults.
@@ -54,9 +51,6 @@ func New() *Config {
 
 	// Logging
 	cfg.LogLevel = envOrDefault("GOBTR_LOG_LEVEL", "info")
-
-	// BTDU options
-	cfg.BTDUUseBolt = envOrDefault("GOBTR_BTDU_USE_BOLT", "true") == "true"
 
 	return cfg
 }

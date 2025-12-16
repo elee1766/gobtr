@@ -137,17 +137,18 @@ var ioctlSpaceInfo = ioctl.IOWR(btrfsIoctlMagic, 20, unsafe.Sizeof(btrfsIoctlSpa
 
 // Block group type flags
 const (
-	BlockGroupData     = 1 << 0
-	BlockGroupSystem   = 1 << 1
-	BlockGroupMetadata = 1 << 2
-	BlockGroupRaid0    = 1 << 3
-	BlockGroupRaid1    = 1 << 4
-	BlockGroupDup      = 1 << 5
-	BlockGroupRaid10   = 1 << 6
-	BlockGroupRaid5    = 1 << 7
-	BlockGroupRaid6    = 1 << 8
-	BlockGroupRaid1C3  = 1 << 9
-	BlockGroupRaid1C4  = 1 << 10
+	BlockGroupData       = 1 << 0
+	BlockGroupSystem     = 1 << 1
+	BlockGroupMetadata   = 1 << 2
+	BlockGroupRaid0      = 1 << 3
+	BlockGroupRaid1      = 1 << 4
+	BlockGroupDup        = 1 << 5
+	BlockGroupRaid10     = 1 << 6
+	BlockGroupRaid5      = 1 << 7
+	BlockGroupRaid6      = 1 << 8
+	BlockGroupRaid1C3    = 1 << 9
+	BlockGroupRaid1C4    = 1 << 10
+	SpaceInfoGlobalRsv   = 1 << 49 // BTRFS_SPACE_INFO_GLOBAL_RSV
 )
 
 // DeviceInfoIoctl contains device info from ioctl
@@ -442,6 +443,9 @@ func GetDeviceChunkAllocations(path string) ([]*DeviceChunkAllocation, error) {
 }
 
 func getBlockGroupType(flags uint64) string {
+	if flags&SpaceInfoGlobalRsv != 0 {
+		return "GlobalReserve"
+	}
 	if flags&BlockGroupData != 0 {
 		return "Data"
 	}

@@ -120,7 +120,17 @@ func (m *Manager) GetFilesystemUsage(path string) (*FilesystemUsage, error) {
 	devPathByID := make(map[uint64]string)
 	for _, dev := range devices {
 		devPathByID[dev.DevID] = dev.Path
+		m.logger.Debug("device info",
+			"devID", dev.DevID,
+			"path", dev.Path,
+			"totalBytes", dev.TotalBytes,
+			"bytesUsed", dev.BytesUsed,
+		)
 	}
+	m.logger.Debug("filesystem device summary",
+		"numDevices", len(devices),
+		"fsUUID", fsInfo.UUID,
+	)
 
 	// Calculate totals from devices
 	for _, dev := range devices {
@@ -128,6 +138,11 @@ func (m *Manager) GetFilesystemUsage(path string) (*FilesystemUsage, error) {
 		usage.DeviceAllocated += int64(dev.BytesUsed)
 	}
 	usage.DeviceUnallocated = usage.DeviceSize - usage.DeviceAllocated
+	m.logger.Debug("calculated totals",
+		"deviceSize", usage.DeviceSize,
+		"deviceAllocated", usage.DeviceAllocated,
+		"deviceUnallocated", usage.DeviceUnallocated,
+	)
 
 	// Get per-device chunk allocations
 	chunkAllocs, err := GetDeviceChunkAllocations(path)

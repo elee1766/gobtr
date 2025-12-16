@@ -72,9 +72,13 @@ async function loadFilesystems(): Promise<FilesystemSummary[]> {
     const statsFs = statsResp.filesystems.find(s => s.path === fs.path);
     if (statsFs && statsFs.devices) {
       for (const dev of statsFs.devices) {
+        // Skip the "total" entry to avoid double counting
+        if (dev.devicePath === "total") continue;
         summary.totalBytes += dev.totalBytes;
         summary.usedBytes += dev.usedBytes;
         summary.freeBytes += dev.freeBytes;
+        // Add device stats errors to error count
+        summary.errorCount += Number(dev.writeErrors + dev.readErrors + dev.flushErrors + dev.corruptionErrors + dev.generationErrors);
       }
     }
 

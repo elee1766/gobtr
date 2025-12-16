@@ -16,85 +16,30 @@ import (
 )
 
 type UsageHandler struct {
-	logger *slog.Logger
-	db     *db.DB
-
-	// Storage backends (one or the other based on config)
-	store     *btdu.Store     // In-memory backend
-	boltStore *btdu.BoltStore // BBolt backend
-	useBolt   bool
-
-	// Active samplers keyed by filesystem path
-	samplers     map[string]*btdu.Sampler     // In-memory samplers
-	boltSamplers map[string]*btdu.BoltSampler // BBolt samplers
-
-	// Cached sessions for stopped samplers (only for in-memory backend)
-	sessionCache map[string]*btdu.Session
-	mu           sync.RWMutex
+	logger   *slog.Logger
+	db       *db.DB
+	store    *btdu.PebbleStore
+	samplers map[string]*btdu.PebbleSampler
+	mu       sync.RWMutex
 }
 
 func NewUsageHandler(logger *slog.Logger, db *db.DB, cfg *config.Config) (*UsageHandler, error) {
-	h := &UsageHandler{
-		logger:       logger.With("handler", "usage"),
-		db:           db,
-		useBolt:      cfg.BTDUUseBolt,
-		samplers:     make(map[string]*btdu.Sampler),
-		boltSamplers: make(map[string]*btdu.BoltSampler),
-		sessionCache: make(map[string]*btdu.Session),
-	}
-
-	if cfg.BTDUUseBolt {
-		boltStore, err := btdu.NewBoltStore(cfg.BTDUStoreDir)
-		if err != nil {
-			return nil, fmt.Errorf("create btdu bolt store: %w", err)
-		}
-		h.boltStore = boltStore
-		logger.Info("using BBolt backend for btdu storage")
-	} else {
-		store, err := btdu.NewStore(cfg.BTDUStoreDir)
-		if err != nil {
-			return nil, fmt.Errorf("create btdu store: %w", err)
-		}
-		h.store = store
-		// Preload existing sessions into cache for fast initial requests
-		go h.preloadSessions()
-		logger.Info("using in-memory backend for btdu storage")
-	}
-
-	return h, nil
-}
-
-// preloadSessions loads all stored sessions into the cache on startup.
-// Only used for in-memory backend.
-func (h *UsageHandler) preloadSessions() {
-	if h.store == nil {
-		return
-	}
-	sessions, err := h.store.List()
+	store, err := btdu.NewPebbleStore(cfg.BTDUStoreDir)
 	if err != nil {
-		h.logger.Warn("failed to list stored sessions", "error", err)
-		return
+		return nil, fmt.Errorf("create btdu pebble store: %w", err)
 	}
 
-	for _, info := range sessions {
-		if info.FSPath == "" {
-			continue
-		}
-		session, err := h.store.Load(info.FSPath)
-		if err != nil {
-			h.logger.Debug("failed to preload session", "fs_path", info.FSPath, "error", err)
-			continue
-		}
-		h.mu.Lock()
-		h.sessionCache[info.FSPath] = session
-		h.mu.Unlock()
-		h.logger.Debug("preloaded session", "fs_path", info.FSPath, "samples", session.SampleCount)
-	}
+	logger.Info("using PebbleDB backend for btdu storage", "dir", cfg.BTDUStoreDir)
+
+	return &UsageHandler{
+		logger:   logger.With("handler", "usage"),
+		db:       db,
+		store:    store,
+		samplers: make(map[string]*btdu.PebbleSampler),
+	}, nil
 }
 
-// getSampler returns an existing in-memory sampler or creates a new one.
-// Only used when useBolt is false.
-func (h *UsageHandler) getSampler(fsPath string) (*btdu.Sampler, error) {
+func (h *UsageHandler) getSampler(fsPath string) (*btdu.PebbleSampler, error) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 
@@ -102,68 +47,13 @@ func (h *UsageHandler) getSampler(fsPath string) (*btdu.Sampler, error) {
 		return sampler, nil
 	}
 
-	sampler, err := btdu.NewSampler(fsPath, h.store, true) // resume=true
+	sampler, err := btdu.NewPebbleSampler(fsPath, h.store, true)
 	if err != nil {
 		return nil, err
 	}
 
 	h.samplers[fsPath] = sampler
-	// Clear session cache when creating new sampler (it has fresh session)
-	delete(h.sessionCache, fsPath)
 	return sampler, nil
-}
-
-// getBoltSampler returns an existing BBolt sampler or creates a new one.
-// Only used when useBolt is true.
-func (h *UsageHandler) getBoltSampler(fsPath string) (*btdu.BoltSampler, error) {
-	h.mu.Lock()
-	defer h.mu.Unlock()
-
-	if sampler, ok := h.boltSamplers[fsPath]; ok {
-		return sampler, nil
-	}
-
-	sampler, err := btdu.NewBoltSampler(fsPath, h.boltStore, true) // resume=true
-	if err != nil {
-		return nil, err
-	}
-
-	h.boltSamplers[fsPath] = sampler
-	return sampler, nil
-}
-
-// getSession returns a session for the filesystem path.
-// Priority: active sampler > cache > disk.
-// Sessions loaded from disk are cached for subsequent requests.
-func (h *UsageHandler) getSession(fsPath string) *btdu.Session {
-	h.mu.RLock()
-	sampler, hasSampler := h.samplers[fsPath]
-	cached, hasCached := h.sessionCache[fsPath]
-	h.mu.RUnlock()
-
-	// Active sampler takes priority
-	if hasSampler && sampler != nil {
-		return sampler.Session
-	}
-
-	// Return cached session
-	if hasCached {
-		return cached
-	}
-
-	// Load from disk and cache
-	if h.store.Has(fsPath) {
-		session, err := h.store.Load(fsPath)
-		if err != nil {
-			return nil
-		}
-		h.mu.Lock()
-		h.sessionCache[fsPath] = session
-		h.mu.Unlock()
-		return session
-	}
-
-	return nil
 }
 
 func (h *UsageHandler) StartSampling(
@@ -176,31 +66,6 @@ func (h *UsageHandler) StartSampling(
 		return nil, connect.NewError(connect.CodeInvalidArgument, fmt.Errorf("fs_path is required"))
 	}
 
-	if h.useBolt {
-		sampler, err := h.getBoltSampler(req.Msg.FsPath)
-		if err != nil {
-			h.logger.Error("failed to get bolt sampler", "error", err)
-			return nil, connect.NewError(connect.CodeInternal, err)
-		}
-
-		if !req.Msg.Resume {
-			sampler.Clear()
-		}
-
-		resumed, err := sampler.Start(context.Background())
-		if err != nil {
-			h.logger.Error("failed to start sampling", "error", err)
-			return nil, connect.NewError(connect.CodeInternal, err)
-		}
-
-		return connect.NewResponse(&apiv1.StartSamplingResponse{
-			Started:         true,
-			Resumed:         resumed,
-			ExistingSamples: sampler.Session().SampleCount(),
-		}), nil
-	}
-
-	// In-memory backend
 	sampler, err := h.getSampler(req.Msg.FsPath)
 	if err != nil {
 		h.logger.Error("failed to get sampler", "error", err)
@@ -220,7 +85,7 @@ func (h *UsageHandler) StartSampling(
 	return connect.NewResponse(&apiv1.StartSamplingResponse{
 		Started:         true,
 		Resumed:         resumed,
-		ExistingSamples: sampler.Session.SampleCount,
+		ExistingSamples: sampler.Session().SampleCount(),
 	}), nil
 }
 
@@ -232,26 +97,6 @@ func (h *UsageHandler) StopSampling(
 
 	if req.Msg.FsPath == "" {
 		return nil, connect.NewError(connect.CodeInvalidArgument, fmt.Errorf("fs_path is required"))
-	}
-
-	if h.useBolt {
-		h.mu.RLock()
-		sampler, ok := h.boltSamplers[req.Msg.FsPath]
-		h.mu.RUnlock()
-
-		if !ok {
-			return connect.NewResponse(&apiv1.StopSamplingResponse{
-				Stopped:      false,
-				TotalSamples: 0,
-			}), nil
-		}
-
-		sampler.Stop()
-
-		return connect.NewResponse(&apiv1.StopSamplingResponse{
-			Stopped:      true,
-			TotalSamples: sampler.Session().SampleCount(),
-		}), nil
 	}
 
 	h.mu.RLock()
@@ -269,7 +114,7 @@ func (h *UsageHandler) StopSampling(
 
 	return connect.NewResponse(&apiv1.StopSamplingResponse{
 		Stopped:      true,
-		TotalSamples: sampler.Session.SampleCount,
+		TotalSamples: sampler.Session().SampleCount(),
 	}), nil
 }
 
@@ -288,57 +133,29 @@ func (h *UsageHandler) GetSamplingStatus(
 	}
 	hasSession := false
 
-	if h.useBolt {
-		h.mu.RLock()
-		sampler, ok := h.boltSamplers[req.Msg.FsPath]
-		h.mu.RUnlock()
+	h.mu.RLock()
+	sampler, ok := h.samplers[req.Msg.FsPath]
+	h.mu.RUnlock()
 
-		if ok && sampler != nil {
-			progress.IsRunning = sampler.IsRunning()
-			progress.CurrentPath = sampler.CurrentPath()
-			progress.SamplesPerSecond = sampler.SamplesPerSecond()
-			progress.RecentPaths = sampler.RecentPaths(16)
+	if ok && sampler != nil {
+		progress.IsRunning = sampler.IsRunning()
+		progress.CurrentPath = sampler.CurrentPath()
+		progress.SamplesPerSecond = sampler.SamplesPerSecond()
+		progress.RecentPaths = sampler.RecentPaths(16)
 
-			session := sampler.Session()
+		session := sampler.Session()
+		hasSession = true
+		progress.SampleCount = session.SampleCount()
+		progress.TotalSize = session.TotalSize()
+		progress.RunningTimeSeconds = int64(session.GetRunningTime().Seconds())
+	} else if h.store != nil && h.store.Has(req.Msg.FsPath) {
+		session, err := h.store.Open(req.Msg.FsPath)
+		if err == nil {
 			hasSession = true
 			progress.SampleCount = session.SampleCount()
 			progress.TotalSize = session.TotalSize()
 			progress.RunningTimeSeconds = int64(session.GetRunningTime().Seconds())
-		} else if h.boltStore != nil && h.boltStore.Has(req.Msg.FsPath) {
-			// Open session just to get status
-			session, err := h.boltStore.Open(req.Msg.FsPath)
-			if err == nil {
-				hasSession = true
-				progress.SampleCount = session.SampleCount()
-				progress.TotalSize = session.TotalSize()
-				progress.RunningTimeSeconds = int64(session.GetRunningTime().Seconds())
-				session.Close()
-			}
-		}
-	} else {
-		h.mu.RLock()
-		sampler, ok := h.samplers[req.Msg.FsPath]
-		h.mu.RUnlock()
-
-		if ok && sampler != nil {
-			progress.IsRunning = sampler.IsRunning()
-			progress.CurrentPath = sampler.CurrentPath()
-			progress.SamplesPerSecond = sampler.SamplesPerSecond()
-			progress.RecentPaths = sampler.RecentPaths(16)
-
-			hasSession = true
-			progress.SampleCount = sampler.Session.SampleCount
-			progress.TotalSize = sampler.Session.TotalSize
-			progress.RunningTimeSeconds = int64(sampler.Session.GetRunningTime().Seconds())
-		} else {
-			// Use cached session (loads from disk once, then cached)
-			session := h.getSession(req.Msg.FsPath)
-			if session != nil {
-				hasSession = true
-				progress.SampleCount = session.SampleCount
-				progress.TotalSize = session.TotalSize
-				progress.RunningTimeSeconds = int64(session.GetRunningTime().Seconds())
-			}
+			session.Close()
 		}
 	}
 
@@ -358,31 +175,16 @@ func (h *UsageHandler) ClearSampling(
 		return nil, connect.NewError(connect.CodeInvalidArgument, fmt.Errorf("fs_path is required"))
 	}
 
-	if h.useBolt {
-		h.mu.Lock()
-		sampler, ok := h.boltSamplers[req.Msg.FsPath]
-		if ok {
-			sampler.Clear()
-			delete(h.boltSamplers, req.Msg.FsPath)
-		}
-		h.mu.Unlock()
+	h.mu.Lock()
+	sampler, ok := h.samplers[req.Msg.FsPath]
+	if ok {
+		sampler.Clear()
+		delete(h.samplers, req.Msg.FsPath)
+	}
+	h.mu.Unlock()
 
-		if !ok && h.boltStore != nil {
-			h.boltStore.Delete(req.Msg.FsPath)
-		}
-	} else {
-		h.mu.Lock()
-		sampler, ok := h.samplers[req.Msg.FsPath]
-		if ok {
-			sampler.Clear()
-			delete(h.samplers, req.Msg.FsPath)
-		}
-		delete(h.sessionCache, req.Msg.FsPath)
-		h.mu.Unlock()
-
-		if !ok && h.store != nil {
-			h.store.Delete(req.Msg.FsPath)
-		}
+	if !ok && h.store != nil {
+		h.store.Delete(req.Msg.FsPath)
 	}
 
 	return connect.NewResponse(&apiv1.ClearSamplingResponse{
@@ -419,27 +221,19 @@ func (h *UsageHandler) GetUsageTree(
 		limit = 100
 	}
 
-	if h.useBolt {
-		return h.getUsageTreeBolt(req.Msg.FsPath, path, sortBy, sortDesc, limit)
-	}
-	return h.getUsageTreeMemory(req.Msg.FsPath, path, sortBy, sortDesc, limit)
-}
-
-// getUsageTreeBolt handles GetUsageTree for BBolt backend.
-func (h *UsageHandler) getUsageTreeBolt(fsPath, path, sortBy string, sortDesc bool, limit int) (*connect.Response[apiv1.GetUsageTreeResponse], error) {
 	// Get session from active sampler or open from disk
-	var session *btdu.BoltSession
+	var session *btdu.PebbleSession
 	var needClose bool
 
 	h.mu.RLock()
-	sampler, ok := h.boltSamplers[fsPath]
+	sampler, ok := h.samplers[req.Msg.FsPath]
 	h.mu.RUnlock()
 
 	if ok && sampler != nil {
 		session = sampler.Session()
-	} else if h.boltStore != nil && h.boltStore.Has(fsPath) {
+	} else if h.store != nil && h.store.Has(req.Msg.FsPath) {
 		var err error
-		session, err = h.boltStore.Open(fsPath)
+		session, err = h.store.Open(req.Msg.FsPath)
 		if err != nil {
 			return connect.NewResponse(&apiv1.GetUsageTreeResponse{
 				Children:     nil,
@@ -465,7 +259,6 @@ func (h *UsageHandler) getUsageTreeBolt(fsPath, path, sortBy string, sortDesc bo
 	totalSamples := session.SampleCount()
 	totalSize := session.TotalSize()
 
-	// Get children from BBolt
 	children, err := session.GetChildren(path)
 	if err != nil {
 		return nil, connect.NewError(connect.CodeInternal, err)
@@ -512,7 +305,6 @@ func (h *UsageHandler) getUsageTreeBolt(fsPath, path, sortBy string, sortDesc bo
 			percentage = float64(estimatedSize) / float64(totalSize) * 100
 		}
 
-		// Check if has children by looking for entries with this path as prefix
 		childChildren, _ := session.GetChildren(c.Path)
 		hasChildren := len(childChildren) > 0
 
@@ -536,7 +328,6 @@ func (h *UsageHandler) getUsageTreeBolt(fsPath, path, sortBy string, sortDesc bo
 		if totalSamples > 0 {
 			estimatedSize = (samples * totalSize) / totalSamples
 		}
-		// Extract name from path
 		name := path
 		if idx := lastIndexOf(path, '/'); idx >= 0 && idx < len(path)-1 {
 			name = path[idx+1:]
@@ -551,117 +342,6 @@ func (h *UsageHandler) getUsageTreeBolt(fsPath, path, sortBy string, sortDesc bo
 			Samples:       samples,
 			EstimatedSize: estimatedSize,
 			ChildCount:    int32(len(children)),
-		}
-	}
-
-	return connect.NewResponse(&apiv1.GetUsageTreeResponse{
-		Children:     protoChildren,
-		Current:      current,
-		TotalSamples: totalSamples,
-		TotalSize:    totalSize,
-	}), nil
-}
-
-// getUsageTreeMemory handles GetUsageTree for in-memory backend.
-func (h *UsageHandler) getUsageTreeMemory(fsPath, path, sortBy string, sortDesc bool, limit int) (*connect.Response[apiv1.GetUsageTreeResponse], error) {
-	session := h.getSession(fsPath)
-	if session == nil {
-		return connect.NewResponse(&apiv1.GetUsageTreeResponse{
-			Children:     nil,
-			TotalSamples: 0,
-			TotalSize:    0,
-		}), nil
-	}
-
-	node := session.Root.GetPath(path)
-	if node == nil {
-		node = session.Root
-	}
-
-	type childInfo struct {
-		node    *btdu.PathNode
-		name    string
-		samples uint64
-	}
-
-	directChildren := node.DirectChildren()
-	children := make([]childInfo, 0, len(directChildren))
-	for name, child := range directChildren {
-		children = append(children, childInfo{
-			node:    child,
-			name:    name,
-			samples: child.Stats.TotalSamples(),
-		})
-	}
-
-	sort.Slice(children, func(i, j int) bool {
-		var cmp int
-		switch sortBy {
-		case "name":
-			if children[i].name < children[j].name {
-				cmp = -1
-			} else if children[i].name > children[j].name {
-				cmp = 1
-			}
-		default:
-			si := children[i].samples
-			sj := children[j].samples
-			if si < sj {
-				cmp = -1
-			} else if si > sj {
-				cmp = 1
-			}
-		}
-		if sortDesc {
-			return cmp > 0
-		}
-		return cmp < 0
-	})
-
-	if len(children) > limit {
-		children = children[:limit]
-	}
-
-	var protoChildren []*apiv1.UsageNode
-	totalSamples := session.SampleCount
-	totalSize := session.TotalSize
-
-	for _, c := range children {
-		samples := c.node.Stats.TotalSamples()
-		var estimatedSize uint64
-		if totalSamples > 0 {
-			estimatedSize = (samples * totalSize) / totalSamples
-		}
-		var percentage float64
-		if totalSize > 0 {
-			percentage = float64(estimatedSize) / float64(totalSize) * 100
-		}
-
-		protoChildren = append(protoChildren, &apiv1.UsageNode{
-			Name:          c.name,
-			FullPath:      c.node.FullPath(),
-			IsDir:         c.node.ChildCount() > 0,
-			Samples:       samples,
-			EstimatedSize: estimatedSize,
-			Percentage:    percentage,
-			ChildCount:    int32(c.node.ChildCount()),
-		})
-	}
-
-	var current *apiv1.UsageNode
-	if node != nil {
-		samples := node.Stats.TotalSamples()
-		var estimatedSize uint64
-		if totalSamples > 0 {
-			estimatedSize = (samples * totalSize) / totalSamples
-		}
-		current = &apiv1.UsageNode{
-			Name:          node.Name,
-			FullPath:      node.FullPath(),
-			IsDir:         node.ChildCount() > 0,
-			Samples:       samples,
-			EstimatedSize: estimatedSize,
-			ChildCount:    int32(node.ChildCount()),
 		}
 	}
 
@@ -705,37 +385,20 @@ func (h *UsageHandler) StreamSamplingProgress(
 				IsRunning: false,
 			}
 
-			if h.useBolt {
-				h.mu.RLock()
-				sampler, ok := h.boltSamplers[req.Msg.FsPath]
-				h.mu.RUnlock()
+			h.mu.RLock()
+			sampler, ok := h.samplers[req.Msg.FsPath]
+			h.mu.RUnlock()
 
-				if ok && sampler != nil {
-					progress.IsRunning = sampler.IsRunning()
-					progress.CurrentPath = sampler.CurrentPath()
-					progress.SamplesPerSecond = sampler.SamplesPerSecond()
-					progress.RecentPaths = sampler.RecentPaths(16)
+			if ok && sampler != nil {
+				progress.IsRunning = sampler.IsRunning()
+				progress.CurrentPath = sampler.CurrentPath()
+				progress.SamplesPerSecond = sampler.SamplesPerSecond()
+				progress.RecentPaths = sampler.RecentPaths(16)
 
-					session := sampler.Session()
-					progress.SampleCount = session.SampleCount()
-					progress.TotalSize = session.TotalSize()
-					progress.RunningTimeSeconds = int64(session.GetRunningTime().Seconds())
-				}
-			} else {
-				h.mu.RLock()
-				sampler, ok := h.samplers[req.Msg.FsPath]
-				h.mu.RUnlock()
-
-				if ok && sampler != nil {
-					progress.IsRunning = sampler.IsRunning()
-					progress.CurrentPath = sampler.CurrentPath()
-					progress.SamplesPerSecond = sampler.SamplesPerSecond()
-					progress.RecentPaths = sampler.RecentPaths(16)
-
-					progress.SampleCount = sampler.Session.SampleCount
-					progress.TotalSize = sampler.Session.TotalSize
-					progress.RunningTimeSeconds = int64(sampler.Session.GetRunningTime().Seconds())
-				}
+				session := sampler.Session()
+				progress.SampleCount = session.SampleCount()
+				progress.TotalSize = session.TotalSize()
+				progress.RunningTimeSeconds = int64(session.GetRunningTime().Seconds())
 			}
 
 			if err := stream.Send(progress); err != nil {

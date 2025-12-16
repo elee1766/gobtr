@@ -1,6 +1,11 @@
 package btdu
 
-import "time"
+import (
+	"encoding/binary"
+	"math"
+	"strings"
+	"time"
+)
 
 // SampleType represents the type of sample measurement.
 type SampleType int
@@ -82,4 +87,122 @@ func (s *PathStats) TotalSamples() uint64 {
 		total += d.Samples
 	}
 	return total
+}
+
+// SampleRecord represents a single sample measurement.
+type SampleRecord struct {
+	Path     string
+	Type     SampleType
+	Offset   Offset
+	Duration time.Duration
+}
+
+// InodeResult represents the result of a logical-to-inode lookup.
+type InodeResult struct {
+	Inum   uint64
+	Offset uint64
+	Root   uint64
+}
+
+// ChildInfo contains information about a child path node.
+type ChildInfo struct {
+	Name  string
+	Path  string
+	Stats PathStats
+}
+
+// RankedPath represents a path with its sample count and estimated size.
+type RankedPath struct {
+	Path    string
+	Samples uint64
+	Size    uint64
+}
+
+// recentPathsSize is the number of recent paths to track.
+const recentPathsSize = 32
+
+// statsEncodedSize is the size of the encoded PathStats structure.
+const statsEncodedSize = int(NumSampleTypes)*8*2 + 16 // samples + durations + distributed
+
+// Encoding helpers for binary serialization
+
+func putUint64(buf []byte, v uint64) {
+	binary.LittleEndian.PutUint64(buf, v)
+}
+
+func getUint64(buf []byte) uint64 {
+	return binary.LittleEndian.Uint64(buf)
+}
+
+func putInt64(buf []byte, v int64) {
+	binary.LittleEndian.PutUint64(buf, uint64(v))
+}
+
+func getInt64(buf []byte) int64 {
+	return int64(binary.LittleEndian.Uint64(buf))
+}
+
+func putFloat64(buf []byte, v float64) {
+	binary.LittleEndian.PutUint64(buf, math.Float64bits(v))
+}
+
+func getFloat64(buf []byte) float64 {
+	return math.Float64frombits(binary.LittleEndian.Uint64(buf))
+}
+
+func encodeUint64(v uint64) []byte {
+	buf := make([]byte, 8)
+	binary.LittleEndian.PutUint64(buf, v)
+	return buf
+}
+
+func decodeUint64(data []byte) uint64 {
+	if len(data) < 8 {
+		return 0
+	}
+	return binary.LittleEndian.Uint64(data)
+}
+
+func encodeInt64(v int64) []byte {
+	buf := make([]byte, 8)
+	binary.LittleEndian.PutUint64(buf, uint64(v))
+	return buf
+}
+
+func decodeInt64(data []byte) int64 {
+	if len(data) < 8 {
+		return 0
+	}
+	return int64(binary.LittleEndian.Uint64(data))
+}
+
+func encodeTime(t time.Time) []byte {
+	return encodeInt64(t.UnixNano())
+}
+
+func decodeTime(data []byte) time.Time {
+	nano := decodeInt64(data)
+	if nano == 0 {
+		return time.Time{}
+	}
+	return time.Unix(0, nano)
+}
+
+// String helpers
+
+func joinPath(segments []string) string {
+	return strings.Join(segments, "/")
+}
+
+func hasPrefix(s, prefix string) bool {
+	return strings.HasPrefix(s, prefix)
+}
+
+func indexOf(s string, c byte) int {
+	for i := 0; i < len(s); i++ {
+		if s[i] == c {
+			return i
+		}
+	}
+	return -1
 }

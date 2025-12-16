@@ -2,7 +2,6 @@ package handlers
 
 import (
 	"context"
-	"database/sql"
 	"fmt"
 	"log/slog"
 	"sync"
@@ -12,7 +11,6 @@ import (
 	apiv1 "github.com/elee1766/gobtr/gen/api/v1"
 	"github.com/elee1766/gobtr/pkg/btrfs"
 	"github.com/elee1766/gobtr/pkg/db"
-	"github.com/elee1766/gobtr/pkg/db/queries"
 )
 
 type ScrubHandler struct {
@@ -26,53 +24,6 @@ func NewScrubHandler(logger *slog.Logger, db *db.DB, btrfsManager *btrfs.Manager
 		logger:       logger.With("handler", "scrub"),
 		db:           db,
 		btrfsManager: btrfsManager,
-	}
-}
-
-// scrubFlags holds the flags used for the current scrub, keyed by device path
-var (
-	currentScrubFlags = make(map[string]*btrfs.ScrubOptions)
-	scrubFlagsMutex   sync.Mutex
-)
-
-// recordScrubToHistory upserts a scrub record using the btrfs UUID
-func (h *ScrubHandler) recordScrubToHistory(devicePath string, status *btrfs.ScrubStatus) {
-	if status.UUID == "" {
-		return
-	}
-
-	scrubHistory := &queries.ScrubHistory{
-		ScrubID:             status.UUID,
-		DevicePath:          devicePath,
-		StartedAt:           status.StartedAt,
-		Status:              status.Status,
-		BytesScrubbed:       sql.NullInt64{Int64: status.BytesScrubbed, Valid: true},
-		TotalBytes:          sql.NullInt64{Int64: status.TotalBytes, Valid: true},
-		DataErrors:          status.DataErrors,
-		TreeErrors:          status.TreeErrors,
-		CorrectedErrors:     status.CorrectedErrors,
-		UncorrectableErrors: status.UncorrectableErrors,
-	}
-
-	// Get flags if we have them stored
-	scrubFlagsMutex.Lock()
-	if opts, ok := currentScrubFlags[devicePath]; ok {
-		scrubHistory.FlagReadonly = opts.Readonly
-		scrubHistory.FlagLimitBytesPerSec = opts.LimitBytesPerSec
-		scrubHistory.FlagForce = opts.Force
-		// Clean up flags when scrub is done
-		if status.Status != "running" && status.Status != "starting" {
-			delete(currentScrubFlags, devicePath)
-		}
-	}
-	scrubFlagsMutex.Unlock()
-
-	if !status.FinishedAt.IsZero() {
-		scrubHistory.FinishedAt = sql.NullTime{Time: status.FinishedAt, Valid: true}
-	}
-
-	if err := queries.UpsertScrub(h.db.Conn(), scrubHistory); err != nil {
-		h.logger.Warn("failed to record scrub to history", "error", err, "uuid", status.UUID)
 	}
 }
 
@@ -137,23 +88,12 @@ func (h *ScrubHandler) StartScrub(
 		Force:            req.Msg.Force,
 	}
 
-	// Store flags for recording to history later
-	scrubFlagsMutex.Lock()
-	currentScrubFlags[req.Msg.DevicePath] = &opts
-	scrubFlagsMutex.Unlock()
-
 	// Start the scrub with options
 	scrubID, err := h.btrfsManager.StartScrubWithOptions(ctx, req.Msg.DevicePath, opts)
 	if err != nil {
 		h.logger.Error("failed to start scrub", "error", err)
-		// Clean up flags on error
-		scrubFlagsMutex.Lock()
-		delete(currentScrubFlags, req.Msg.DevicePath)
-		scrubFlagsMutex.Unlock()
 		return nil, connect.NewError(connect.CodeInternal, err)
 	}
-
-	// Scrub will be recorded to history via status polling using btrfs UUID
 
 	return connect.NewResponse(&apiv1.StartScrubResponse{
 		ScrubId: scrubID,
@@ -178,12 +118,6 @@ func (h *ScrubHandler) CancelScrub(
 		return nil, connect.NewError(connect.CodeInternal, err)
 	}
 
-	// Get status after cancel and record to history
-	status, err := h.btrfsManager.GetScrubStatus(req.Msg.DevicePath)
-	if err == nil && status.UUID != "" {
-		h.recordScrubToHistory(req.Msg.DevicePath, status)
-	}
-
 	return connect.NewResponse(&apiv1.CancelScrubResponse{
 		Success: true,
 	}), nil
@@ -199,7 +133,7 @@ func (h *ScrubHandler) GetScrubStatus(
 		return nil, connect.NewError(connect.CodeInvalidArgument, fmt.Errorf("device_path is required"))
 	}
 
-	// Get current status from btrfs
+	// Get current status from btrfs status file
 	status, err := h.btrfsManager.GetScrubStatus(req.Msg.DevicePath)
 	if err != nil {
 		h.logger.Error("failed to get scrub status", "error", err)
@@ -208,11 +142,6 @@ func (h *ScrubHandler) GetScrubStatus(
 
 	// Convert to proto
 	progress := statusToProto(status)
-
-	// Record scrub to history using btrfs UUID (upsert handles duplicates)
-	if status.UUID != "" && status.Status != "never_run" {
-		h.recordScrubToHistory(req.Msg.DevicePath, status)
-	}
 
 	return connect.NewResponse(&apiv1.GetScrubStatusResponse{
 		Progress:  progress,
@@ -266,47 +195,11 @@ func (h *ScrubHandler) ListScrubHistory(
 	ctx context.Context,
 	req *connect.Request[apiv1.ListScrubHistoryRequest],
 ) (*connect.Response[apiv1.ListScrubHistoryResponse], error) {
-	h.logger.Debug("list scrub history", "device", req.Msg.DevicePath, "limit", req.Msg.Limit)
-
-	limit := int(req.Msg.Limit)
-	if limit <= 0 {
-		limit = 50
-	}
-
-	// Get history from database
-	history, err := queries.ListScrubHistory(h.db.Conn(), req.Msg.DevicePath, limit)
-	if err != nil {
-		h.logger.Error("failed to list scrub history", "error", err)
-		return nil, connect.NewError(connect.CodeInternal, err)
-	}
-
-	// Convert to proto
-	var entries []*apiv1.ScrubHistoryEntry
-	for _, h := range history {
-		entry := &apiv1.ScrubHistoryEntry{
-			ScrubId:         h.ScrubID,
-			DevicePath:      h.DevicePath,
-			StartedAt:       h.StartedAt.Unix(),
-			Status:          h.Status,
-			CorrectedErrors: h.CorrectedErrors,
-			Flags: &apiv1.ScrubFlags{
-				Readonly:         h.FlagReadonly,
-				LimitBytesPerSec: h.FlagLimitBytesPerSec,
-				Force:            h.FlagForce,
-			},
-		}
-
-		if h.FinishedAt.Valid {
-			entry.FinishedAt = h.FinishedAt.Time.Unix()
-		}
-
-		entry.TotalErrors = h.DataErrors + h.TreeErrors + h.UncorrectableErrors
-
-		entries = append(entries, entry)
-	}
-
+	// Scrub history is now read directly from btrfs status files
+	// Each filesystem only has the most recent scrub in /var/lib/btrfs/scrub.status.<UUID>
+	// Return empty list - frontend should use GetScrubStatus instead
 	return connect.NewResponse(&apiv1.ListScrubHistoryResponse{
-		Entries: entries,
+		Entries: nil,
 	}), nil
 }
 
@@ -345,11 +238,6 @@ func (h *ScrubHandler) GetAllScrubStatus(
 			result.Progress = statusToProto(status)
 			result.IsRunning = status.IsRunning
 			results[idx] = result
-
-			// Record scrub to history using btrfs UUID
-			if status.UUID != "" && status.Status != "never_run" {
-				h.recordScrubToHistory(fsPath, status)
-			}
 		}(i, fs.Path)
 	}
 

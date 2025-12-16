@@ -96,7 +96,20 @@ export function OverviewTab(props: { fs: TrackedFilesystem }) {
     if (!subs) return 0;
     return countBackups(subs, props.fs.btrbkSnapshotDir);
   });
-  const errorCount = createMemo(() => errors.latest?.length ?? 0);
+  // Combine database errors and device stats errors
+  const errorCount = createMemo(() => {
+    const dbErrors = errors.latest?.length ?? 0;
+    // Also count device stats errors (excluding "total" entry)
+    const stats = deviceStats.latest;
+    let deviceErrors = 0n;
+    if (stats) {
+      for (const dev of stats) {
+        if (dev.devicePath === "total") continue;
+        deviceErrors += dev.writeErrors + dev.readErrors + dev.flushErrors + dev.corruptionErrors + dev.generationErrors;
+      }
+    }
+    return dbErrors + Number(deviceErrors);
+  });
 
   const scrubInfo = createMemo(() => {
     const data = scrubData.latest;
@@ -116,6 +129,8 @@ export function OverviewTab(props: { fs: TrackedFilesystem }) {
   const deviceCount = createMemo(() => {
     const stats = deviceStats.latest;
     const u = usage.latest;
+    // Filter out the "total" entry from device count
+    const statsCount = stats?.filter((d: any) => d.devicePath !== "total").length || 0;
     let allocDeviceCount = 0;
     if (u) {
       const paths = new Set<string>();
@@ -124,7 +139,7 @@ export function OverviewTab(props: { fs: TrackedFilesystem }) {
       }
       allocDeviceCount = paths.size;
     }
-    return Math.max(stats?.length || 0, allocDeviceCount);
+    return Math.max(statsCount, allocDeviceCount);
   });
 
   return (
@@ -416,9 +431,10 @@ function SpaceAllocationsCard(props: { usage: any; showRaw: boolean }) {
 
 function DevicesCard(props: { usage: any; deviceStats: any; showRaw: boolean }) {
   const deviceList = createMemo(() => {
-    const hasRealDevices = props.deviceStats.length > 0 && props.deviceStats[0].devicePath && props.deviceStats[0].devicePath !== "total";
-    if (hasRealDevices) {
-      return props.deviceStats.map((d: any) => ({
+    // Filter out "total" entry from device stats
+    const realDevices = props.deviceStats.filter((d: any) => d.devicePath && d.devicePath !== "total");
+    if (realDevices.length > 0) {
+      return realDevices.map((d: any) => ({
         path: d.devicePath,
         totalBytes: d.totalBytes,
         deviceId: d.deviceId,
@@ -463,11 +479,18 @@ function DevicesCard(props: { usage: any; deviceStats: any; showRaw: boolean }) 
       <div class="divide-y divide-border-subtle">
         <For each={deviceList()}>
           {(dev) => {
-            const deviceAllocations = () => getDeviceAllocations(dev.path);
+            const deviceAllocations = () => getDeviceAllocations(dev.path).filter((a: any) => a.type !== "Unallocated");
             const totalErrors = () => dev.writeErrors + dev.readErrors + dev.flushErrors + dev.corruptionErrors + dev.generationErrors;
             const allocTotal = () => deviceAllocations().reduce((sum: bigint, a: any) => sum + a.size, 0n);
+            // Unallocated = device total - sum of allocations
+            const unallocated = () => {
+              const total = dev.totalBytes;
+              const alloc = allocTotal();
+              return total > alloc ? total - alloc : 0n;
+            };
+            // Use device totalBytes as denominator to show full capacity
             const pctWidth = (size: bigint) => {
-              const total = allocTotal();
+              const total = dev.totalBytes;
               if (total === 0n) return 0;
               return Number((size * 10000n) / total) / 100;
             };
@@ -493,18 +516,20 @@ function DevicesCard(props: { usage: any; deviceStats: any; showRaw: boolean }) 
                       <div title={`${alloc.type}: ${formatBytes(alloc.size)}`} style={{ width: `${pctWidth(alloc.size)}%`, "background-color": getUsageBarColor(alloc.type) }} class="h-full border-r border-bg-surface/50 last:border-r-0 hover:brightness-110 transition-all cursor-pointer" />
                     )}
                   </For>
+                  {/* Unallocated space shown relative to device capacity */}
+                  <Show when={unallocated() > 0n}>
+                    <div title={`Unallocated: ${formatBytes(unallocated())}`} style={{ width: `${pctWidth(unallocated())}%`, "background-color": getUsageBarColor("Unallocated") }} class="h-full hover:brightness-110 transition-all cursor-pointer" />
+                  </Show>
                 </div>
                 <div class="flex flex-wrap gap-x-3 text-[10px] text-text-tertiary">
-                  <For each={deviceAllocations().filter((a: any) => a.type !== "Unallocated")}>
+                  <For each={deviceAllocations()}>
                     {(alloc: any) => (
-                      <span><span class="inline-block w-2 h-2 rounded-sm mr-0.5" style={{ "background-color": getUsageBarColor(alloc.type) }} />{alloc.type.slice(0, 4)} {formatBytes(alloc.size)}</span>
+                      <span><span class="inline-block w-2 h-2 rounded-sm mr-0.5" style={{ "background-color": getUsageBarColor(alloc.type) }} />{alloc.type.slice(0, 4)} <FormattedBytes bytes={alloc.size} showRaw={props.showRaw} /></span>
                     )}
                   </For>
-                  {(() => {
-                    const unalloc = deviceAllocations().find((a: any) => a.type === "Unallocated");
-                    if (!unalloc) return null;
-                    return <span><span class="inline-block w-2 h-2 rounded-sm mr-0.5" style={{ "background-color": getUsageBarColor("Unallocated") }} />Free {formatBytes(unalloc.size)}</span>;
-                  })()}
+                  <Show when={unallocated() > 0n}>
+                    <span><span class="inline-block w-2 h-2 rounded-sm mr-0.5" style={{ "background-color": getUsageBarColor("Unallocated") }} />Free <FormattedBytes bytes={unallocated()} showRaw={props.showRaw} /></span>
+                  </Show>
                 </div>
               </div>
             );

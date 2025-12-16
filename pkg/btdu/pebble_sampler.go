@@ -3,6 +3,7 @@ package btdu
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"math/rand"
 	"os"
 	"sync"
@@ -12,14 +13,13 @@ import (
 	"github.com/dennwc/btrfs"
 )
 
-// BoltSampler performs disk usage sampling with BBolt-backed storage.
-// This uses significantly less memory than the in-memory sampler.
-type BoltSampler struct {
+// PebbleSampler performs disk usage sampling with PebbleDB-backed storage.
+type PebbleSampler struct {
 	fsPath  string
 	fs      *btrfs.FS
 	fsFile  *os.File
-	session *BoltSession
-	store   *BoltStore
+	session *PebbleSession
+	store   *PebbleStore
 	chunks  *ChunkList
 
 	// State
@@ -35,16 +35,10 @@ type BoltSampler struct {
 	samplesPerSec   atomic.Int64
 	lastSampleCount uint64
 	lastSampleTime  time.Time
-
-	// Batching for better write performance
-	sampleBatch   []SampleRecord
-	batchMu       sync.Mutex
-	batchSize     int
-	lastBatchTime time.Time
 }
 
-// NewBoltSampler creates a new sampler with BBolt-backed storage.
-func NewBoltSampler(fsPath string, store *BoltStore, resume bool) (*BoltSampler, error) {
+// NewPebbleSampler creates a new sampler with PebbleDB-backed storage.
+func NewPebbleSampler(fsPath string, store *PebbleStore, resume bool) (*PebbleSampler, error) {
 	fs, err := btrfs.Open(fsPath, true)
 	if err != nil {
 		return nil, fmt.Errorf("open btrfs filesystem: %w", err)
@@ -56,7 +50,9 @@ func NewBoltSampler(fsPath string, store *BoltStore, resume bool) (*BoltSampler,
 		return nil, fmt.Errorf("open fs for ioctl: %w", err)
 	}
 
-	chunks, err := EnumerateChunks(fsFile)
+	// Only enumerate DATA chunks for sampling - metadata/system chunks
+	// don't have file inodes so LOGICAL_INO won't find anything
+	chunks, err := EnumerateDataChunks(fsFile)
 	if err != nil {
 		fs.Close()
 		fsFile.Close()
@@ -70,18 +66,24 @@ func NewBoltSampler(fsPath string, store *BoltStore, resume bool) (*BoltSampler,
 		return nil, fmt.Errorf("no chunks found in filesystem")
 	}
 
-	// Open or create BBolt session
-	var session *BoltSession
+	var session *PebbleSession
 	if resume && store != nil && store.Has(fsPath) {
 		session, err = store.Open(fsPath)
 		if err != nil {
-			// Failed to load, create new
 			session, _, err = store.OpenOrCreate(fsPath, totalSize)
 			if err != nil {
 				fs.Close()
 				fsFile.Close()
 				return nil, fmt.Errorf("create session: %w", err)
 			}
+		}
+		// Always update total size to current chunk total in case filesystem changed
+		if session.TotalSize() != totalSize {
+			slog.Info("updating session total size",
+				"old", session.TotalSize(),
+				"new", totalSize,
+			)
+			session.SetTotalSize(totalSize)
 		}
 	} else if store != nil {
 		session, _, err = store.OpenOrCreate(fsPath, totalSize)
@@ -93,17 +95,16 @@ func NewBoltSampler(fsPath string, store *BoltStore, resume bool) (*BoltSampler,
 	} else {
 		fs.Close()
 		fsFile.Close()
-		return nil, fmt.Errorf("store is required for BoltSampler")
+		return nil, fmt.Errorf("store is required for PebbleSampler")
 	}
 
-	s := &BoltSampler{
-		fsPath:    fsPath,
-		fs:        fs,
-		fsFile:    fsFile,
-		store:     store,
-		session:   session,
-		chunks:    chunks,
-		batchSize: 100, // Batch 100 samples before writing
+	s := &PebbleSampler{
+		fsPath:  fsPath,
+		fs:      fs,
+		fsFile:  fsFile,
+		store:   store,
+		session: session,
+		chunks:  chunks,
 	}
 
 	for i := range s.recentPaths {
@@ -112,16 +113,21 @@ func NewBoltSampler(fsPath string, store *BoltStore, resume bool) (*BoltSampler,
 
 	s.refreshRootPaths()
 
+	// Log chunk statistics (only data chunks are enumerated for sampling)
+	slog.Info("data chunk statistics for sampling",
+		"dataChunks", len(chunks.Chunks),
+		"dataSize", chunks.TotalSize,
+	)
+
 	return s, nil
 }
 
-// Session returns the underlying BBolt session.
-func (s *BoltSampler) Session() *BoltSession {
+// Session returns the underlying Pebble session.
+func (s *PebbleSampler) Session() *PebbleSession {
 	return s.session
 }
 
-// refreshRootPaths updates the root ID to path lookup map.
-func (s *BoltSampler) refreshRootPaths() {
+func (s *PebbleSampler) refreshRootPaths() {
 	subvols, err := s.fs.ListSubvolumes(nil)
 	if err != nil {
 		return
@@ -134,7 +140,7 @@ func (s *BoltSampler) refreshRootPaths() {
 	}
 }
 
-func (s *BoltSampler) getRootPath(rootID uint64) string {
+func (s *PebbleSampler) getRootPath(rootID uint64) string {
 	if v, ok := s.rootPaths.Load(rootID); ok {
 		return v.(string)
 	}
@@ -148,8 +154,8 @@ func (s *BoltSampler) getRootPath(rootID uint64) string {
 	return ""
 }
 
-// Close closes the sampler and releases resources.
-func (s *BoltSampler) Close() error {
+// Close closes the sampler.
+func (s *PebbleSampler) Close() error {
 	s.Stop()
 	if s.session != nil {
 		s.session.Close()
@@ -164,29 +170,34 @@ func (s *BoltSampler) Close() error {
 }
 
 // Start starts sampling.
-func (s *BoltSampler) Start(ctx context.Context) (bool, error) {
+func (s *PebbleSampler) Start(ctx context.Context) (bool, error) {
 	if s.running.Load() {
 		return false, fmt.Errorf("sampler already running")
 	}
 
 	resumed := s.session.SampleCount() > 0
 
+	// Use chunks' totalSize (current filesystem state) rather than session's potentially stale value
+	totalSize := s.chunks.TotalSize
+	if totalSize == 0 {
+		return false, fmt.Errorf("filesystem has no allocated chunks")
+	}
+
 	ctx, cancel := context.WithCancel(ctx)
 	s.cancelFunc = cancel
 	s.running.Store(true)
 	s.lastSampleTime = time.Now()
 	s.lastSampleCount = s.session.SampleCount()
-	s.lastBatchTime = time.Now()
 
 	s.session.StartRun()
 
-	go s.sampleLoop(ctx, s.session.TotalSize())
+	go s.sampleLoop(ctx, totalSize)
 
 	return resumed, nil
 }
 
-// Stop stops the sampler and saves the session.
-func (s *BoltSampler) Stop() {
+// Stop stops the sampler.
+func (s *PebbleSampler) Stop() {
 	if !s.running.Load() {
 		return
 	}
@@ -197,20 +208,18 @@ func (s *BoltSampler) Stop() {
 	}
 	s.running.Store(false)
 
-	// Flush any remaining samples
-	s.flushBatch()
-
+	// Workers flush their batches on context cancel, then session flush persists
 	s.session.StopRun()
 	s.session.Flush()
 }
 
-// IsRunning returns whether the sampler is currently running.
-func (s *BoltSampler) IsRunning() bool {
+// IsRunning returns whether the sampler is running.
+func (s *PebbleSampler) IsRunning() bool {
 	return s.running.Load()
 }
 
-// CurrentPath returns the most recent path being sampled.
-func (s *BoltSampler) CurrentPath() string {
+// CurrentPath returns the most recent path.
+func (s *PebbleSampler) CurrentPath() string {
 	idx := s.pathIndex.Load()
 	if idx == 0 {
 		idx = recentPathsSize - 1
@@ -225,7 +234,7 @@ func (s *BoltSampler) CurrentPath() string {
 }
 
 // RecentPaths returns the last N sampled paths.
-func (s *BoltSampler) RecentPaths(n int) []string {
+func (s *PebbleSampler) RecentPaths(n int) []string {
 	if n > recentPathsSize {
 		n = recentPathsSize
 	}
@@ -250,28 +259,27 @@ func (s *BoltSampler) RecentPaths(n int) []string {
 	return result
 }
 
-func (s *BoltSampler) addRecentPath(path string) {
+func (s *PebbleSampler) addRecentPath(path string) {
 	idx := s.pathIndex.Add(1) % recentPathsSize
 	s.recentPaths[idx].Store(path)
 }
 
 // SamplesPerSecond returns the current sampling rate.
-func (s *BoltSampler) SamplesPerSecond() float64 {
+func (s *PebbleSampler) SamplesPerSecond() float64 {
 	return float64(s.samplesPerSec.Load())
 }
 
 // Clear resets the session data.
-func (s *BoltSampler) Clear() error {
+func (s *PebbleSampler) Clear() error {
 	s.Stop()
 
-	// Close current session
-	if s.session != nil {
-		s.session.Close()
-	}
-
-	// Delete and recreate
+	// Delete from store
 	if s.store != nil {
 		s.store.Delete(s.fsPath)
+	}
+
+	// Create fresh session
+	if s.store != nil {
 		session, _, err := s.store.OpenOrCreate(s.fsPath, s.chunks.TotalSize)
 		if err != nil {
 			return err
@@ -279,31 +287,45 @@ func (s *BoltSampler) Clear() error {
 		s.session = session
 	}
 
+	// Reset stats
+	s.lastSampleCount = 0
+	s.lastSampleTime = time.Now()
+	s.samplesPerSec.Store(0)
+
+	// Clear recent paths
+	for i := range s.recentPaths {
+		s.recentPaths[i].Store("")
+	}
+	s.pathIndex.Store(0)
+
 	return nil
 }
 
-// sampleLoop is the main sampling loop.
-func (s *BoltSampler) sampleLoop(ctx context.Context, totalSize uint64) {
-	rng := rand.New(rand.NewSource(time.Now().UnixNano()))
-
+func (s *PebbleSampler) sampleLoop(ctx context.Context, totalSize uint64) {
 	statsTicker := time.NewTicker(time.Second)
 	defer statsTicker.Stop()
 
-	// Channel for flushing batches asynchronously
-	flushChan := make(chan []SampleRecord, 2)
-	flushDone := make(chan struct{})
+	// Flush ticker - flush every 5 seconds (accumulator handles batching)
+	flushTicker := time.NewTicker(5 * time.Second)
+	defer flushTicker.Stop()
 
-	// Background goroutine for flushing batches
-	go func() {
-		defer close(flushDone)
-		for batch := range flushChan {
-			s.session.AddSampleBatch(batch)
-		}
-	}()
+	// Start worker goroutines - each adds directly to session accumulator
+	numWorkers := 8
+	var wg sync.WaitGroup
+	workerCtx, workerCancel := context.WithCancel(ctx)
+
+	for i := 0; i < numWorkers; i++ {
+		wg.Add(1)
+		go func(workerID int) {
+			defer wg.Done()
+			rng := rand.New(rand.NewSource(time.Now().UnixNano() + int64(workerID)))
+			s.sampleWorkerDirect(workerCtx, rng, totalSize)
+		}(i)
+	}
 
 	defer func() {
-		close(flushChan)
-		<-flushDone // Wait for flush goroutine to finish
+		workerCancel()
+		wg.Wait()
 	}()
 
 	for {
@@ -319,109 +341,53 @@ func (s *BoltSampler) sampleLoop(ctx context.Context, totalSize uint64) {
 			}
 			s.lastSampleCount = currentCount
 			s.lastSampleTime = time.Now()
-		default:
-			s.sampleOnceAsync(rng, totalSize, flushChan)
+		case <-flushTicker.C:
+			// Periodic flush to disk
+			s.session.FlushAccumulator()
 		}
 	}
 }
 
-// flushBatch writes accumulated samples to the database.
-func (s *BoltSampler) flushBatch() {
-	s.batchMu.Lock()
-	if len(s.sampleBatch) == 0 {
-		s.batchMu.Unlock()
-		return
-	}
-	batch := s.sampleBatch
-	s.sampleBatch = nil
-	s.batchMu.Unlock()
+// sampleWorkerDirect adds samples directly to session accumulator for immediate query visibility
+func (s *PebbleSampler) sampleWorkerDirect(ctx context.Context, rng *rand.Rand, totalSize uint64) {
+	// Small local batch to reduce lock contention
+	batch := make([]SampleRecord, 0, 32)
 
-	s.session.AddSampleBatch(batch)
-}
-
-// sampleOnceAsync samples a single random block and sends batches to flush channel.
-func (s *BoltSampler) sampleOnceAsync(rng *rand.Rand, totalSize uint64, flushChan chan<- []SampleRecord) {
-	start := time.Now()
-
-	pos := uint64(rng.Int63n(int64(totalSize)))
-	logicalAddr := s.chunks.SamplePosition(pos)
-
-	path, sampleType := s.resolveLogicalAddress(logicalAddr)
-
-	s.addRecentPath(path)
-
-	duration := time.Since(start)
-
-	offset := Offset{
-		Physical: 0,
-		Logical:  logicalAddr,
-	}
-
-	// Add to batch
-	s.batchMu.Lock()
-	s.sampleBatch = append(s.sampleBatch, SampleRecord{
-		Path:     path,
-		Type:     sampleType,
-		Offset:   offset,
-		Duration: duration,
-	})
-
-	// Flush if batch is full
-	if len(s.sampleBatch) >= s.batchSize {
-		batch := s.sampleBatch
-		s.sampleBatch = make([]SampleRecord, 0, s.batchSize)
-		s.batchMu.Unlock()
-
-		// Non-blocking send - if channel is full, continue sampling
+	for {
 		select {
-		case flushChan <- batch:
+		case <-ctx.Done():
+			// Flush remaining
+			if len(batch) > 0 {
+				s.session.AddSampleBatch(batch)
+			}
+			return
 		default:
-			// Channel full, flush synchronously
-			s.session.AddSampleBatch(batch)
+			start := time.Now()
+			pos := uint64(rng.Int63n(int64(totalSize)))
+			logicalAddr := s.chunks.SamplePosition(pos)
+
+			path, sampleType := s.resolveLogicalAddress(logicalAddr)
+			s.addRecentPath(path)
+
+			duration := time.Since(start)
+
+			batch = append(batch, SampleRecord{
+				Path:     path,
+				Type:     sampleType,
+				Offset:   Offset{Logical: logicalAddr},
+				Duration: duration,
+			})
+
+			// Flush small batch frequently for live visibility
+			if len(batch) >= 32 {
+				s.session.AddSampleBatch(batch)
+				batch = make([]SampleRecord, 0, 32)
+			}
 		}
-	} else {
-		s.batchMu.Unlock()
 	}
 }
 
-// sampleOnce samples a single random block (synchronous version for compatibility).
-func (s *BoltSampler) sampleOnce(rng *rand.Rand, totalSize uint64) {
-	start := time.Now()
-
-	pos := uint64(rng.Int63n(int64(totalSize)))
-	logicalAddr := s.chunks.SamplePosition(pos)
-
-	path, sampleType := s.resolveLogicalAddress(logicalAddr)
-
-	s.addRecentPath(path)
-
-	duration := time.Since(start)
-
-	offset := Offset{
-		Physical: 0,
-		Logical:  logicalAddr,
-	}
-
-	// Add to batch
-	s.batchMu.Lock()
-	s.sampleBatch = append(s.sampleBatch, SampleRecord{
-		Path:     path,
-		Type:     sampleType,
-		Offset:   offset,
-		Duration: duration,
-	})
-
-	// Flush if batch is full
-	shouldFlush := len(s.sampleBatch) >= s.batchSize
-	s.batchMu.Unlock()
-
-	if shouldFlush {
-		s.flushBatch()
-	}
-}
-
-// resolveLogicalAddress resolves a logical address to a file path.
-func (s *BoltSampler) resolveLogicalAddress(logicalAddr uint64) (string, SampleType) {
+func (s *PebbleSampler) resolveLogicalAddress(logicalAddr uint64) (string, SampleType) {
 	inodes, err := s.logicalIno(logicalAddr)
 	if err != nil || len(inodes) == 0 {
 		return "<free>", Unresolved
@@ -468,13 +434,10 @@ func (s *BoltSampler) resolveLogicalAddress(logicalAddr uint64) (string, SampleT
 	return representativePath, sampleType
 }
 
-// logicalIno calls BTRFS_IOC_LOGICAL_INO
-func (s *BoltSampler) logicalIno(logical uint64) ([]InodeResult, error) {
-	// Reuse the parent sampler's implementation via package-level function
+func (s *PebbleSampler) logicalIno(logical uint64) ([]InodeResult, error) {
 	return logicalInoImpl(s.fsFile, logical)
 }
 
-// inodeLookup calls BTRFS_IOC_INO_LOOKUP
-func (s *BoltSampler) inodeLookup(treeID, objectID uint64) (string, error) {
+func (s *PebbleSampler) inodeLookup(treeID, objectID uint64) (string, error) {
 	return inodeLookupImpl(s.fsFile, treeID, objectID)
 }

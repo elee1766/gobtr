@@ -24,6 +24,7 @@ type ChunkList struct {
 
 // btrfs tree search constants
 const (
+	btrfsIoctlMagic             = 0x94
 	btrfsChunkTreeObjectID      = 3
 	btrfsFirstChunkTreeObjectID = 256
 	btrfsChunkItemKey           = 228
@@ -81,8 +82,25 @@ type btrfsChunk struct {
 	// Followed by btrfs_stripe array
 }
 
+// Block group type constants
+const (
+	btrfsBlockGroupData     = 1 << 0
+	btrfsBlockGroupSystem   = 1 << 1
+	btrfsBlockGroupMetadata = 1 << 2
+)
+
 // EnumerateChunks reads all chunks from the filesystem's chunk tree.
+// If dataOnly is true, only DATA chunks are included (for sampling).
 func EnumerateChunks(fsFile *os.File) (*ChunkList, error) {
+	return enumerateChunksFiltered(fsFile, false)
+}
+
+// EnumerateDataChunks reads only DATA chunks from the filesystem's chunk tree.
+func EnumerateDataChunks(fsFile *os.File) (*ChunkList, error) {
+	return enumerateChunksFiltered(fsFile, true)
+}
+
+func enumerateChunksFiltered(fsFile *os.File, dataOnly bool) (*ChunkList, error) {
 	chunks := &ChunkList{}
 
 	args := btrfsIoctlSearchArgs{}
@@ -131,12 +149,15 @@ func EnumerateChunks(fsFile *os.File) (*ChunkList, error) {
 						Type:   binary.LittleEndian.Uint64(args.Buf[offset+24:]),
 					}
 
-					chunks.Chunks = append(chunks.Chunks, Chunk{
-						LogicalOffset: header.Offset,
-						Length:        chunk.Length,
-						Type:          chunk.Type,
-					})
-					chunks.TotalSize += chunk.Length
+					// Filter to data chunks only if requested
+					if !dataOnly || (chunk.Type&btrfsBlockGroupData != 0) {
+						chunks.Chunks = append(chunks.Chunks, Chunk{
+							LogicalOffset: header.Offset,
+							Length:        chunk.Length,
+							Type:          chunk.Type,
+						})
+						chunks.TotalSize += chunk.Length
+					}
 				}
 			}
 
@@ -174,7 +195,6 @@ func (cl *ChunkList) SamplePosition(pos uint64) uint64 {
 
 // IsDataChunk returns true if the given logical address is in a data chunk.
 func (cl *ChunkList) IsDataChunk(logicalAddr uint64) bool {
-	const btrfsBlockGroupData = 1 << 0
 	for _, chunk := range cl.Chunks {
 		if logicalAddr >= chunk.LogicalOffset && logicalAddr < chunk.LogicalOffset+chunk.Length {
 			return chunk.Type&btrfsBlockGroupData != 0

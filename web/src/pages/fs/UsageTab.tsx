@@ -5,6 +5,38 @@ import { formatBytes } from "@/lib/utils";
 import { uiSettings } from "@/stores/ui";
 import { usageClient } from "@/api/client";
 
+// Circular countdown indicator
+function CountdownCircle(props: { countdown: number; total: number }) {
+  const radius = 5;
+  const circumference = 2 * Math.PI * radius;
+  const progress = () => (props.countdown / props.total) * circumference;
+
+  return (
+    <svg width="14" height="14" class="inline-block" style={{ transform: "rotate(-90deg)" }}>
+      <circle
+        cx="7"
+        cy="7"
+        r={radius}
+        fill="none"
+        stroke="currentColor"
+        stroke-width="2"
+        class="text-border-default"
+      />
+      <circle
+        cx="7"
+        cy="7"
+        r={radius}
+        fill="none"
+        stroke="currentColor"
+        stroke-width="2"
+        stroke-dasharray={circumference}
+        stroke-dashoffset={circumference - progress()}
+        class="text-primary"
+      />
+    </svg>
+  );
+}
+
 interface TreeNode {
   name: string;
   fullPath: string;
@@ -100,7 +132,9 @@ export function UsageTab(props: { fs: TrackedFilesystem }) {
   // Poll for status updates - separate status and tree refresh for performance
   let statusInterval: number | undefined;
   let treeRefreshInterval: number | undefined;
-  const TREE_REFRESH_MS = 3000; // Only refresh tree every 3 seconds
+  let countdownInterval: number | undefined;
+  const TREE_REFRESH_SECS = 3; // Only refresh tree every 3 seconds
+  const [treeRefreshCountdown, setTreeRefreshCountdown] = createSignal(TREE_REFRESH_SECS);
 
   onMount(() => {
     // Initial fetch
@@ -119,10 +153,17 @@ export function UsageTab(props: { fs: TrackedFilesystem }) {
         prevSessionId = currentSessionId;
         prevSampleCount = Number(result.progress?.sampleCount ?? 0n);
         await refreshTree();
+        setTreeRefreshCountdown(TREE_REFRESH_SECS);
       } else {
         // Just track sample count for display
         prevSampleCount = Number(result.progress?.sampleCount ?? 0n);
       }
+    }, 1000) as unknown as number;
+
+    // Countdown ticker - updates every second
+    countdownInterval = setInterval(() => {
+      if (autoRefreshPaused()) return;
+      setTreeRefreshCountdown((c) => (c <= 1 ? TREE_REFRESH_SECS : c - 1));
     }, 1000) as unknown as number;
 
     // Slower tree refresh (3s) - reduces network load during active sampling
@@ -132,17 +173,24 @@ export function UsageTab(props: { fs: TrackedFilesystem }) {
       if (!status) return;
 
       const running = status.progress?.isRunning ?? false;
+      const hasSamples = (status.progress?.sampleCount ?? 0n) > 0n;
 
-      // Only auto-refresh tree during active sampling
-      if (running && treeData.length > 0) {
-        await refreshTree();
+      // Auto-refresh tree during active sampling OR when there's data to show
+      if (running || (hasSamples && treeData.length === 0)) {
+        if (treeData.length > 0) {
+          await refreshTree();
+        } else {
+          // Initial load when tree is empty but we have samples
+          await loadRoot();
+        }
       }
-    }, TREE_REFRESH_MS) as unknown as number;
+    }, TREE_REFRESH_SECS * 1000) as unknown as number;
   });
 
   onCleanup(() => {
     if (statusInterval) clearInterval(statusInterval);
     if (treeRefreshInterval) clearInterval(treeRefreshInterval);
+    if (countdownInterval) clearInterval(countdownInterval);
   });
 
   // Refresh entire tree while preserving expanded state
@@ -493,19 +541,24 @@ export function UsageTab(props: { fs: TrackedFilesystem }) {
           </div>
           {/* Controls */}
           <div class="flex items-center space-x-2">
-            {/* Auto-refresh pause toggle */}
-            <button
-              class={`px-2 py-1 text-xs cursor-pointer ${
-                autoRefreshPaused()
-                  ? "bg-warning-soft text-text-inverse hover:bg-warning"
-                  : "bg-bg-muted text-text-secondary hover:bg-border-strong"
-              }`}
-              onClick={() => setAutoRefreshPaused(!autoRefreshPaused())}
-              title={autoRefreshPaused() ? "Resume auto-refresh" : "Pause auto-refresh"}
-              disabled={initialLoading()}
-            >
-              {autoRefreshPaused() ? "paused" : "live"}
-            </button>
+            {/* Auto-refresh pause toggle with countdown */}
+            <div class="flex items-center gap-1">
+              <Show when={!autoRefreshPaused() && !initialLoading()}>
+                <CountdownCircle countdown={treeRefreshCountdown()} total={TREE_REFRESH_SECS} />
+              </Show>
+              <button
+                class={`px-2 py-1 text-xs cursor-pointer ${
+                  autoRefreshPaused()
+                    ? "bg-warning-soft text-text-inverse hover:bg-warning"
+                    : "bg-bg-muted text-text-secondary hover:bg-border-strong"
+                }`}
+                onClick={() => setAutoRefreshPaused(!autoRefreshPaused())}
+                title={autoRefreshPaused() ? "Resume auto-refresh" : "Pause auto-refresh"}
+                disabled={initialLoading()}
+              >
+                {autoRefreshPaused() ? "paused" : "live"}
+              </button>
+            </div>
             <Show when={initialLoading()}>
               <span class="text-xs text-text-muted animate-pulse">loading...</span>
             </Show>
