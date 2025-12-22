@@ -245,7 +245,7 @@ func (m *Manager) GetScrubStatusByUUID(fsUUID string) (*ScrubStatus, error) {
 }
 
 // parseScrubStatusFile parses the btrfs scrub status file format.
-// Format: "scrub status:1\nUUID:devid|key1:val1|key2:val2|..."
+// Format: "scrub status:1\nUUID:devid|key1:val1|key2:val2|...\n..." (one line per device)
 func (m *Manager) parseScrubStatusFile(content string) (*ScrubStatus, error) {
 	status := &ScrubStatus{}
 
@@ -255,63 +255,93 @@ func (m *Manager) parseScrubStatusFile(content string) (*ScrubStatus, error) {
 	}
 
 	// First line is "scrub status:1" - we can ignore it
-	// Second line contains all the data in pipe-separated key:value pairs
+	// Remaining lines contain data for each device in pipe-separated key:value pairs
 	// Format: "UUID:devid|key1:val1|key2:val2|..."
-	dataLine := lines[1]
+	// We need to aggregate stats across all devices
 
-	// Split on pipes to get key:value pairs
-	pairs := strings.Split(dataLine, "|")
+	var allFinished, anyAborted bool
+	allFinished = true
 
-	// Helper to get int64 value from pairs
-	values := make(map[string]string)
-	for _, pair := range pairs {
-		kv := strings.SplitN(pair, ":", 2)
-		if len(kv) == 2 {
-			values[kv[0]] = kv[1]
+	for _, dataLine := range lines[1:] {
+		if dataLine == "" {
+			continue
+		}
+
+		// Split on pipes to get key:value pairs
+		pairs := strings.Split(dataLine, "|")
+
+		// Helper to get int64 value from pairs
+		values := make(map[string]string)
+		for _, pair := range pairs {
+			kv := strings.SplitN(pair, ":", 2)
+			if len(kv) == 2 {
+				values[kv[0]] = kv[1]
+			}
+		}
+
+		parseInt64 := func(key string) int64 {
+			if v, ok := values[key]; ok {
+				val, _ := strconv.ParseInt(v, 10, 64)
+				return val
+			}
+			return 0
+		}
+
+		parseInt32 := func(key string) int32 {
+			return int32(parseInt64(key))
+		}
+
+		// Aggregate values across devices
+		status.DataExtentsScrubbed += parseInt64("data_extents_scrubbed")
+		status.TreeExtentsScrubbed += parseInt64("tree_extents_scrubbed")
+		status.DataBytesScrubbed += parseInt64("data_bytes_scrubbed")
+		status.TreeBytesScrubbed += parseInt64("tree_bytes_scrubbed")
+
+		status.ReadErrors += parseInt32("read_errors")
+		status.CsumErrors += parseInt32("csum_errors")
+		status.VerifyErrors += parseInt32("verify_errors")
+		status.NoCsum += parseInt64("no_csum")
+		status.CsumDiscards += parseInt64("csum_discards")
+		status.SuperErrors += parseInt32("super_errors")
+		status.MallocErrors += parseInt32("malloc_errors")
+		status.UncorrectableErrors += parseInt32("uncorrectable_errors")
+		status.CorrectedErrors += parseInt32("corrected_errors")
+
+		// Use max last_physical across devices
+		lastPhys := parseInt64("last_physical")
+		if lastPhys > status.LastPhysical {
+			status.LastPhysical = lastPhys
+		}
+
+		// Use the same start time (should be same for all devices)
+		tStart := parseInt64("t_start")
+		if tStart > 0 && status.StartedAt.IsZero() {
+			status.StartedAt = time.Unix(tStart, 0)
+		}
+
+		// Use max duration (slowest device determines total time)
+		duration := parseInt64("duration")
+		if duration > status.DurationSeconds {
+			status.DurationSeconds = duration
+		}
+
+		// Track finished/canceled status across devices
+		canceled := parseInt64("canceled")
+		finished := parseInt64("finished")
+
+		if canceled == 1 {
+			anyAborted = true
+		}
+		if finished != 1 {
+			allFinished = false
 		}
 	}
 
-	parseInt64 := func(key string) int64 {
-		if v, ok := values[key]; ok {
-			val, _ := strconv.ParseInt(v, 10, 64)
-			return val
-		}
-		return 0
-	}
-
-	parseInt32 := func(key string) int32 {
-		return int32(parseInt64(key))
-	}
-
-	// Parse all the values
-	status.DataExtentsScrubbed = parseInt64("data_extents_scrubbed")
-	status.TreeExtentsScrubbed = parseInt64("tree_extents_scrubbed")
-	status.DataBytesScrubbed = parseInt64("data_bytes_scrubbed")
-	status.TreeBytesScrubbed = parseInt64("tree_bytes_scrubbed")
+	// Calculate totals
 	status.BytesScrubbed = status.DataBytesScrubbed + status.TreeBytesScrubbed
-
-	status.ReadErrors = parseInt32("read_errors")
-	status.CsumErrors = parseInt32("csum_errors")
-	status.VerifyErrors = parseInt32("verify_errors")
-	status.NoCsum = parseInt64("no_csum")
-	status.CsumDiscards = parseInt64("csum_discards")
-	status.SuperErrors = parseInt32("super_errors")
-	status.MallocErrors = parseInt32("malloc_errors")
-	status.UncorrectableErrors = parseInt32("uncorrectable_errors")
-	status.CorrectedErrors = parseInt32("corrected_errors")
-	status.LastPhysical = parseInt64("last_physical")
-
-	// Calculate legacy error sum
 	status.DataErrors = status.ReadErrors + status.CsumErrors + status.VerifyErrors
 
-	// Parse timestamps
-	tStart := parseInt64("t_start")
-	if tStart > 0 {
-		status.StartedAt = time.Unix(tStart, 0)
-	}
-
-	// Duration is in seconds
-	status.DurationSeconds = parseInt64("duration")
+	// Format duration string
 	if status.DurationSeconds > 0 {
 		hours := status.DurationSeconds / 3600
 		mins := (status.DurationSeconds % 3600) / 60
@@ -319,28 +349,20 @@ func (m *Manager) parseScrubStatusFile(content string) (*ScrubStatus, error) {
 		status.Duration = fmt.Sprintf("%d:%02d:%02d", hours, mins, secs)
 	}
 
-	// Determine status from canceled and finished flags
-	canceled := parseInt64("canceled")
-	finished := parseInt64("finished")
-
-	if canceled == 1 && finished == 0 {
+	// Determine overall status
+	if anyAborted && !allFinished {
 		status.Status = "aborted"
 		status.IsRunning = false
-	} else if finished == 1 {
+	} else if allFinished {
 		status.Status = "finished"
 		status.IsRunning = false
 		if !status.StartedAt.IsZero() && status.DurationSeconds > 0 {
 			status.FinishedAt = status.StartedAt.Add(time.Duration(status.DurationSeconds) * time.Second)
 		}
-	} else if canceled == 0 && finished == 0 {
-		// Neither canceled nor finished - could be running or interrupted
-		// The file alone can't tell us if it's currently running
-		// We'd need to check for a running scrub process
-		status.Status = "unknown"
-		status.IsRunning = false // Conservative default
 	} else {
-		status.Status = "finished"
-		status.IsRunning = false
+		// Some devices not finished - could be running or interrupted
+		status.Status = "unknown"
+		status.IsRunning = false // Conservative default, will be updated by process check
 	}
 
 	return status, nil

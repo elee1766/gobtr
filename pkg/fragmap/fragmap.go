@@ -3,6 +3,7 @@ package fragmap
 import (
 	"fmt"
 	"log/slog"
+	"math"
 	"os"
 	"sort"
 	"time"
@@ -343,6 +344,31 @@ type FragmentationStats struct {
 	SmallestFree   uint64
 	AvgExtentSize  uint64
 	AvgFreeSize    uint64
+
+	// Free-space fragmentation metrics (based on VxFS guidelines)
+	// These indicate how fragmented the free space is
+
+	// Percentage of free space in extents < 8 blocks (32KB assuming 4K blocks)
+	// Threshold: >5% indicates fragmentation
+	FreeSpaceTinyPct float64
+
+	// Percentage of free space in extents < 64 blocks (256KB assuming 4K blocks)
+	// Threshold: >50% indicates fragmentation
+	FreeSpaceSmallPct float64
+
+	// Percentage of free space in extents >= 64 blocks
+	// Threshold: <5% of total FS size indicates fragmentation
+	FreeSpaceLargePct float64
+
+	// Free-space fragmentation score (0-100, higher = more fragmented)
+	FreeSpaceFragScore float64
+
+	// Largest contiguous free region as percentage of total free
+	LargestFreePct float64
+
+	// Scatter metric - how fragmented is the layout structurally
+	// (many small gaps vs few large contiguous regions)
+	ScatterScore float64 // 0-100, higher = more scattered
 }
 
 // CalculateStats calculates fragmentation statistics for a device block map
@@ -351,6 +377,9 @@ func (bm *DeviceBlockMap) CalculateStats() FragmentationStats {
 		TotalSize:    bm.TotalSize,
 		SmallestFree: ^uint64(0),
 	}
+
+	// First pass: collect basic stats and free region sizes
+	var freeRegionSizes []uint64
 
 	for _, entry := range bm.Entries {
 		if entry.Allocated {
@@ -368,6 +397,7 @@ func (bm *DeviceBlockMap) CalculateStats() FragmentationStats {
 		} else {
 			stats.FreeSize += entry.Length
 			stats.NumFreeRegions++
+			freeRegionSizes = append(freeRegionSizes, entry.Length)
 
 			if entry.Length > stats.LargestFree {
 				stats.LargestFree = entry.Length
@@ -386,6 +416,126 @@ func (bm *DeviceBlockMap) CalculateStats() FragmentationStats {
 	}
 	if stats.SmallestFree == ^uint64(0) {
 		stats.SmallestFree = 0
+	}
+
+	// Calculate adaptive free-space fragmentation metrics
+	if stats.FreeSize > 0 && len(freeRegionSizes) > 0 {
+		// Sort to find percentiles
+		sort.Slice(freeRegionSizes, func(i, j int) bool {
+			return freeRegionSizes[i] < freeRegionSizes[j]
+		})
+
+		// Calculate median
+		var median uint64
+		n := len(freeRegionSizes)
+		if n%2 == 0 {
+			median = (freeRegionSizes[n/2-1] + freeRegionSizes[n/2]) / 2
+		} else {
+			median = freeRegionSizes[n/2]
+		}
+
+		// Adaptive thresholds based on median:
+		// Tiny: < 10% of median
+		// Small: < 50% of median
+		// Large: >= median
+		tinyThreshold := median / 10
+		smallThreshold := median / 2
+
+		var freeSpaceTiny, freeSpaceSmall, freeSpaceLarge uint64
+		for _, size := range freeRegionSizes {
+			if size < tinyThreshold {
+				freeSpaceTiny += size
+			} else if size < smallThreshold {
+				freeSpaceSmall += size
+			} else {
+				freeSpaceLarge += size
+			}
+		}
+
+		stats.FreeSpaceTinyPct = float64(freeSpaceTiny) / float64(stats.FreeSize) * 100
+		stats.FreeSpaceSmallPct = float64(freeSpaceTiny+freeSpaceSmall) / float64(stats.FreeSize) * 100
+		stats.FreeSpaceLargePct = float64(freeSpaceLarge) / float64(stats.FreeSize) * 100
+		stats.LargestFreePct = float64(stats.LargestFree) / float64(stats.FreeSize) * 100
+
+		// Calculate fragmentation score based on how much free space is "usable"
+		// Usable = regions large enough to matter (>= median size)
+		// Score 0 = all free space is in large usable regions
+		// Score 100 = all free space is in tiny unusable fragments
+
+		// Already calculated: FreeSpaceLargePct = % of space in regions >= median
+		// Invert it: more large regions = lower (better) score
+		stats.FreeSpaceFragScore = max(0, 100.0-stats.FreeSpaceLargePct)
+
+		// Scatter score: measures how interleaved free/allocated regions are
+		if stats.NumFreeRegions <= 1 {
+			stats.ScatterScore = 0
+		} else {
+			// Log scale: 1 region = 0, 10 ≈ 33, 100 ≈ 66, 1000 ≈ 100
+			stats.ScatterScore = min(100.0, 33.0*math.Log10(float64(stats.NumFreeRegions)))
+		}
+	}
+
+	return stats
+}
+
+// ChunkUtilizationStats holds utilization statistics by chunk type
+type ChunkUtilizationStats struct {
+	DataAllocated     uint64
+	DataUsed          uint64
+	MetadataAllocated uint64
+	MetadataUsed      uint64
+	SystemAllocated   uint64
+	SystemUsed        uint64
+
+	// Calculated
+	DataUtilization     float64 // 0-100
+	MetadataUtilization float64
+	SystemUtilization   float64
+	DataSlack           uint64 // Allocated - Used
+	MetadataSlack       uint64
+	SystemSlack         uint64
+	TotalSlack          uint64
+	OverallUtilization  float64
+}
+
+// CalculateChunkUtilization calculates how efficiently chunks are being used
+func (fm *FragMap) CalculateChunkUtilization() ChunkUtilizationStats {
+	var stats ChunkUtilizationStats
+
+	for _, chunk := range fm.Chunks {
+		switch {
+		case chunk.Type&BlockTypeData != 0:
+			stats.DataAllocated += chunk.Length
+			stats.DataUsed += chunk.Used
+		case chunk.Type&BlockTypeMetadata != 0:
+			stats.MetadataAllocated += chunk.Length
+			stats.MetadataUsed += chunk.Used
+		case chunk.Type&BlockTypeSystem != 0:
+			stats.SystemAllocated += chunk.Length
+			stats.SystemUsed += chunk.Used
+		}
+	}
+
+	// Calculate utilization percentages
+	if stats.DataAllocated > 0 {
+		stats.DataUtilization = float64(stats.DataUsed) / float64(stats.DataAllocated) * 100
+		stats.DataSlack = stats.DataAllocated - stats.DataUsed
+	}
+	if stats.MetadataAllocated > 0 {
+		stats.MetadataUtilization = float64(stats.MetadataUsed) / float64(stats.MetadataAllocated) * 100
+		stats.MetadataSlack = stats.MetadataAllocated - stats.MetadataUsed
+	}
+	if stats.SystemAllocated > 0 {
+		stats.SystemUtilization = float64(stats.SystemUsed) / float64(stats.SystemAllocated) * 100
+		stats.SystemSlack = stats.SystemAllocated - stats.SystemUsed
+	}
+
+	stats.TotalSlack = stats.DataSlack + stats.MetadataSlack + stats.SystemSlack
+
+	totalAllocated := stats.DataAllocated + stats.MetadataAllocated + stats.SystemAllocated
+	totalUsed := stats.DataUsed + stats.MetadataUsed + stats.SystemUsed
+	if totalAllocated > 0 {
+		stats.OverallUtilization = float64(totalUsed) / float64(totalAllocated) * 100
 	}
 
 	return stats

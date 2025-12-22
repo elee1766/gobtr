@@ -4,10 +4,13 @@ go 1.25.2
 
 require (
 	connectrpc.com/connect v1.19.1
+	github.com/alecthomas/kong v1.13.0
 	github.com/cockroachdb/pebble v1.1.5
 	github.com/dennwc/btrfs v0.0.0-20241002142654-12ae127e0bf6
 	github.com/dennwc/ioctl v1.0.0
+	github.com/dustin/go-humanize v1.0.1
 	github.com/google/uuid v1.6.0
+	github.com/jedib0t/go-pretty/v6 v6.7.7
 	github.com/ncruces/go-sqlite3 v0.30.3
 	github.com/pressly/goose/v3 v3.26.0
 	go.uber.org/fx v1.24.0
@@ -31,6 +34,7 @@ require (
 	github.com/klauspost/compress v1.18.0 // indirect
 	github.com/kr/pretty v0.3.1 // indirect
 	github.com/kr/text v0.2.0 // indirect
+	github.com/mattn/go-runewidth v0.0.16 // indirect
 	github.com/matttproud/golang_protobuf_extensions v1.0.4 // indirect
 	github.com/mfridman/interpolate v0.0.2 // indirect
 	github.com/ncruces/julianday v1.0.0 // indirect
@@ -39,6 +43,7 @@ require (
 	github.com/prometheus/client_model v0.3.0 // indirect
 	github.com/prometheus/common v0.42.0 // indirect
 	github.com/prometheus/procfs v0.15.1 // indirect
+	github.com/rivo/uniseg v0.4.7 // indirect
 	github.com/rogpeppe/go-internal v1.14.1 // indirect
 	github.com/sethvargo/go-retry v0.3.0 // indirect
 	github.com/tetratelabs/wazero v1.10.1 // indirect
